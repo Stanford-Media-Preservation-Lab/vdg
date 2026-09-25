@@ -32,6 +32,13 @@ SCRIPT_TITLE = "Stanford Media Preservation Lab"
 SCRIPT_NAME = "Video Derivative Generator, v1.4.2, July 2026"
 SCRIPT_SEPARATOR = "----"
 
+# Highest FFmpeg major version vdg has been validated against (lossless
+# FFV1/v210 round-trips, ffprobe JSON parsing). macOS runs Homebrew ffmpeg@7,
+# Ubuntu 24.04 runs stock 6.1.x. FFmpeg 9.x is known to break both ffprobe
+# parsing and FFV1/v210 framemd5 validation on macOS (GitHub issue #8).
+# Raise this only after a newer release has been tested on both platforms.
+MAX_TESTED_FFMPEG_MAJOR = 7
+
 def _supports_color() -> bool:
     """Return True if the terminal supports ANSI color codes.
     Checks isatty(), the TERM variable, and the NO_COLOR convention."""
@@ -155,6 +162,14 @@ class VideoInfo:
     interlaced: bool
     is_vfr: bool
     is_quicktime: bool
+    # Where the scan type came from: 'stream' (ffprobe stream field_order),
+    # 'frames' (first-frame fallback, GitHub issue #9) or 'none' (no metadata —
+    # assumed progressive).
+    field_order_source: str = 'stream'
+    field_order_detail: str = ''
+    # Set when a DV source's container-reported frame rate was replaced by the
+    # rate from the DV frame header (e.g. "container reported 60000.00 fps").
+    fps_note: str = ''
 
 @dataclass
 class ProcessingResult:
@@ -179,6 +194,47 @@ class ProcessingStats:
             self.failed_files = []
         if self.quarantined_files is None:
             self.quarantined_files = []
+
+class ConfigError(Exception):
+    """A user-facing setup problem (bad directory, missing format flag) —
+    reported as a plain error message, not a traceback."""
+
+def describe_missing_path(path: Path) -> str:
+    """Explain why a directory path doesn't exist: an unmounted volume, or the
+    deepest part of the path that does exist."""
+    parts = path.parts
+    if len(parts) >= 3 and parts[0] == '/' and parts[1] == 'Volumes':
+        volume = Path('/Volumes') / parts[2]
+        if not volume.exists():
+            return f"The drive '{parts[2]}' is not mounted ({volume} does not exist)."
+    existing = path
+    while not existing.exists() and existing != existing.parent:
+        existing = existing.parent
+    return f"Deepest existing folder on that path: {existing}"
+
+def validate_directories(source_dir: Path, output_dir: Path) -> List[str]:
+    """Check source/output directories before anything is created. Raises
+    ConfigError with a descriptive message; returns notices to log once
+    logging is set up. A missing output folder is created only when its
+    parent exists — otherwise a typo or an unmounted drive would silently
+    create a whole new directory tree (e.g. under /Volumes on the boot disk)."""
+    hint = ("Check --source-dir/--output-dir, and any default paths set in your "
+            "shell alias (~/.zshrc or ~/.bashrc) or in cli.py.")
+    notices = []
+    if not source_dir.exists():
+        raise ConfigError(f"Source directory does not exist: {source_dir}\n"
+                          f"  {describe_missing_path(source_dir)}\n  {hint}")
+    if not source_dir.is_dir():
+        raise ConfigError(f"Source path is not a directory: {source_dir}\n  {hint}")
+    if output_dir.exists():
+        if not output_dir.is_dir():
+            raise ConfigError(f"Output path is not a directory: {output_dir}\n  {hint}")
+    elif not output_dir.parent.exists():
+        raise ConfigError(f"Output directory does not exist, and neither does its parent folder: {output_dir}\n"
+                          f"  {describe_missing_path(output_dir)}\n  {hint}")
+    else:
+        notices.append(f"Output directory did not exist — creating it: {output_dir}")
+    return notices
 
 class Config:
     def __init__(self, args: argparse.Namespace):
@@ -212,12 +268,30 @@ class Config:
         self.keep_failed = args.keep_failed
         self.aac_encoder = detect_aac_encoder()
 
-        if not (self.output_h264 or self.output_v210 or self.output_prores or self.output_ffv1):
-            raise ValueError("At least one output format must be specified (-h264, -v210, -prores, or -ffv1)")
-        if not self.source_dir.exists():
-            raise FileNotFoundError(f"Source directory does not exist: {self.source_dir}")
-        for directory in [self.output_dir, self.log_dir, self.finished_dir, self.quarantine_dir]:
-            directory.mkdir(parents=True, exist_ok=True)
+        # Thumbnail-only mode: --thumbs N with no video format flag regenerates
+        # JP2 thumbnails without encoding a derivative. Sources are left in place
+        # (never moved to finished_sources) and nothing is recorded in the resume
+        # CSV, since the source has normally already been processed.
+        any_format = self.output_h264 or self.output_v210 or self.output_prores or self.output_ffv1
+        self.thumbs_only = not any_format and self.thumb_count is not None
+        if not any_format and not self.thumbs_only:
+            raise ConfigError("At least one output format must be specified (-h264, -v210, -prores, or -ffv1), "
+                              "or --thumbs N on its own to generate thumbnails only")
+        if self.thumbs_only:
+            if self.thumb_count < 1:
+                raise ConfigError("--thumbs must be at least 1 when generating thumbnails only")
+            self.move_finished = False
+        self.setup_notices = validate_directories(self.source_dir, self.output_dir)
+        directories = [self.output_dir, self.log_dir, self.quarantine_dir]
+        if not self.thumbs_only:
+            # Thumbnail-only runs are often pointed at an existing finished_sources
+            # folder — don't create a nested finished_sources inside it.
+            directories.append(self.finished_dir)
+        for directory in directories:
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                raise ConfigError(f"Cannot create directory {directory}: {e.strerror}")
 def setup_logging(log_dir: Path, dry_run: bool) -> logging.Logger:
     logger = logging.getLogger('video_transcoder')
     logger.setLevel(logging.DEBUG)
@@ -264,16 +338,125 @@ def detect_aac_encoder() -> str:
             continue
     return 'aac'
 
+def parse_ffmpeg_version(version_output: str) -> Tuple[Optional[str], Optional[int]]:
+    """Extract (version string, major version) from `ffmpeg -version` / `ffprobe -version` output.
+
+    Handles release builds ("ffmpeg version 7.1.5", "ffprobe version 6.1.1-3ubuntu5",
+    "ffmpeg version n7.1"). Git snapshot builds ("ffmpeg version N-118000-g...")
+    have no release number, so the major version is returned as None.
+    """
+    first_line = version_output.strip().splitlines()[0] if version_output.strip() else ""
+    match = re.match(r'^\S+ version (\S+)', first_line)
+    if not match:
+        return None, None
+    version = match.group(1)
+    major_match = re.match(r'^n?(\d+)\.\d+', version)
+    return version, int(major_match.group(1)) if major_match else None
+
+def get_tool_version(tool: str) -> Tuple[Optional[str], Optional[int]]:
+    try:
+        result = subprocess.run([tool, '-version'], capture_output=True, text=True, timeout=10)
+        return parse_ffmpeg_version(result.stdout)
+    except Exception:
+        return None, None
+
+def check_ffmpeg_version() -> None:
+    """Log the FFmpeg/ffprobe versions in use and warn (without exiting) when
+    they're newer than the tested major version, unparseable, or mismatched."""
+    logger = logging.getLogger('video_transcoder')
+    ffmpeg_version, ffmpeg_major = get_tool_version('ffmpeg')
+    ffprobe_version, ffprobe_major = get_tool_version('ffprobe')
+    logger.info(f"FFmpeg: {ffmpeg_version or 'unknown'} ({shutil.which('ffmpeg')})")
+    if ffprobe_version != ffmpeg_version:
+        logger.info(f"ffprobe: {ffprobe_version or 'unknown'} ({shutil.which('ffprobe')})")
+        logger.warning(f"ffmpeg ({ffmpeg_version or 'unknown'}) and ffprobe ({ffprobe_version or 'unknown'}) "
+                       f"versions differ — check PATH so both come from the same FFmpeg install")
+    checks = [('FFmpeg', ffmpeg_version, ffmpeg_major)]
+    if ffprobe_version != ffmpeg_version:
+        checks = [('ffmpeg', ffmpeg_version, ffmpeg_major), ('ffprobe', ffprobe_version, ffprobe_major)]
+    for tool, version, major in checks:
+        if major is None:
+            logger.warning(f"Could not determine {tool} release version ({version or 'unknown'}) — "
+                           f"vdg is tested with FFmpeg {MAX_TESTED_FFMPEG_MAJOR}.x and earlier")
+        elif major > MAX_TESTED_FFMPEG_MAJOR:
+            logger.warning(f"{tool} {version} is newer than the tested FFmpeg {MAX_TESTED_FFMPEG_MAJOR}.x — "
+                           f"ffprobe parsing and lossless FFV1/v210 validation may fail. "
+                           f"See 'Supported FFmpeg versions' in MANUAL.md")
+
+# MediaInfo summary (GitHub issue #5): fields shown per file, in MediaInfo's own
+# text-output labels and formatting.
+MEDIAINFO_VIDEO_FIELDS = ["Format", "Format profile", "Format settings", "Codec ID", "Duration", "Bit rate",
+                          "Width", "Height", "Display aspect ratio", "Frame rate mode", "Frame rate",
+                          "Standard", "Color space", "Chroma subsampling", "Bit depth", "Scan type", "Scan order"]
+MEDIAINFO_TIMEOUT = 120
+
+def parse_mediainfo_text(text: str) -> List[Tuple[str, Dict[str, str]]]:
+    """Split MediaInfo's default text output into [(section, {label: value})].
+    Section names are as printed ("General", "Video", "Audio #1", ...); the first
+    occurrence of a label within a section wins."""
+    sections: List[Tuple[str, Dict[str, str]]] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if ' : ' not in line:
+            sections.append((line.strip(), {}))
+        elif sections:
+            label, value = line.split(' : ', 1)
+            sections[-1][1].setdefault(label.strip(), value.strip())
+    return sections
+
+def format_mediainfo_summary(text: str) -> List[str]:
+    """Condense MediaInfo text output into the per-file summary lines: container,
+    the first video track's key fields, and one line per audio track."""
+    sections = parse_mediainfo_text(text)
+    general = next((f for name, f in sections if name == 'General'), {})
+    video = next((f for name, f in sections if name == 'Video' or name.startswith('Video #')), {})
+    audio = [(name, f) for name, f in sections if name == 'Audio' or name.startswith('Audio #')]
+    width = max(len(label) for label in MEDIAINFO_VIDEO_FIELDS + ["Container", "File size", "Audio #10"])
+    lines = []
+    container = " / ".join(v for v in (general.get("Format"), general.get("Format profile")) if v)
+    if container:
+        lines.append(f"{'Container':<{width}} : {container}")
+    if general.get("File size"):
+        lines.append(f"{'File size':<{width}} : {general['File size']}")
+    for label in MEDIAINFO_VIDEO_FIELDS:
+        value = video.get(label)
+        if value is None and label == "Duration":
+            value = general.get("Duration")
+        if value is None and label == "Bit rate":
+            value = general.get("Overall bit rate")
+        if value:
+            lines.append(f"{label:<{width}} : {value}")
+    if not audio:
+        lines.append(f"{'Audio':<{width}} : none")
+    for name, f in audio:
+        parts = [f.get(k) for k in ("Format", "Channel(s)", "Sampling rate", "Bit depth")]
+        lines.append(f"{name:<{width}} : {', '.join(p for p in parts if p)}")
+    return lines
+
+def get_mediainfo_summary(file_path: Path) -> Optional[List[str]]:
+    """Run the mediainfo CLI and return summary lines, or None if it fails —
+    a missing summary is logged as a warning and never fails the file."""
+    try:
+        result = subprocess.run(['mediainfo', str(file_path)], capture_output=True, text=True,
+                                timeout=MEDIAINFO_TIMEOUT)
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        return format_mediainfo_summary(result.stdout)
+    except Exception:
+        return None
+
 def check_dependencies() -> bool:
     logger = logging.getLogger('video_transcoder')
     missing_required = False
-    for tool in ['ffmpeg', 'ffprobe']:
+    for tool in ['ffmpeg', 'ffprobe', 'mediainfo']:
         if shutil.which(tool) is None:
             logger.error(f"Required tool '{tool}' not found in PATH")
             missing_required = True
     if missing_required:
         return False
     logger.info("All required dependencies found")
+    check_ffmpeg_version()
     if shutil.which('mediaconch') is None:
         logger.warning("mediaconch not found in PATH — policy conformance checks will be skipped")
     else:
@@ -365,6 +548,59 @@ def detect_variable_packet_durations(file_path: Path, timeout: int = 180) -> boo
     except Exception:
         return False
 
+FIELD_ORDER_PROBE_FRAMES = 5
+
+def parse_dv_system(frame_bytes: bytes) -> Optional[str]:
+    """Read the DV system from the start of a DV frame. The first DIF block is
+    the header section (section type 0 in the top 3 bits of byte 0); bit 7 of
+    byte 3 is the DSF flag: 0 = 525/60 (NTSC family), 1 = 625/50 (PAL family).
+    Same position for DV25, DVCPRO, DV50 and DVCPRO HD."""
+    if len(frame_bytes) < 4 or (frame_bytes[0] >> 5) != 0:
+        return None
+    return '625/50' if frame_bytes[3] & 0x80 else '525/60'
+
+def read_dv_system(file_path: Path, timeout: int = 30) -> Optional[str]:
+    """Copy the first DV frame out of any container (raw .dv, MOV, MKV) and
+    read its DSF flag — independent of container timing, which is what's
+    unreliable on raw/dvrescue DV."""
+    cmd = ['ffmpeg', '-v', 'quiet', '-i', str(file_path), '-map', '0:v:0', '-c', 'copy',
+           '-frames:v', '1', '-f', 'data', '-']
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        return parse_dv_system(result.stdout)
+    except Exception:
+        return None
+
+def dv_nominal_fps(dv_system: str, height: int) -> float:
+    """Frame rate implied by the DV system. DVCPRO HD 720p is progressive at
+    field rate (59.94/50); every other DV variant runs at frame rate (29.97/25)."""
+    if dv_system == '525/60':
+        return 60000 / 1001 if height == 720 else 30000 / 1001
+    return 50.0 if height == 720 else 25.0
+
+def classify_frame_field_order(frames: List[Dict]) -> Optional[str]:
+    """Majority vote over per-frame interlaced_frame/top_field_first flags.
+    Returns 'tff', 'bff', 'progressive', or None if no frames were read."""
+    if not frames:
+        return None
+    interlaced = [f for f in frames if int(f.get('interlaced_frame', 0)) == 1]
+    if len(interlaced) * 2 <= len(frames):
+        return 'progressive'
+    tff = sum(1 for f in interlaced if int(f.get('top_field_first', 0)) == 1)
+    return 'tff' if tff * 2 > len(interlaced) else 'bff'
+
+def detect_field_order_from_frames(file_path: Path, timeout: int = 60) -> Optional[str]:
+    """Fallback scan detection for sources whose stream-level field_order is
+    missing or 'unknown' — notably DV (raw .dv and dvrescue DV-in-MKV), where the
+    field order lives only in the decoded frames. Reads the first few frames."""
+    cmd = ['ffprobe', '-v', 'quiet', '-select_streams', 'v:0', '-read_intervals', f'%+#{FIELD_ORDER_PROBE_FRAMES}',
+           '-show_entries', 'frame=interlaced_frame,top_field_first', '-print_format', 'json', str(file_path)]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return classify_frame_field_order(json.loads(result.stdout).get('frames', []))
+    except Exception:
+        return None
+
 def get_video_info(file_path: Path, warn: bool = True) -> VideoInfo:
     cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format', str(file_path)]
     try:
@@ -389,6 +625,25 @@ def get_video_info(file_path: Path, warn: bool = True) -> VideoInfo:
         fps = eval(fps_str)
     except:
         fps = 30.0
+    fps_note = ''
+    if v_stream.get('codec_name') == 'dvvideo':
+        # DV's frame rate is fixed by its signal system, but raw DV and MKVs
+        # built from raw DV (dvrescue) have no real container timing, so
+        # ffprobe's rate fields can come out as 60000, 30000, hundreds of fps...
+        # Take the rate from the DV frame header instead (falling back to frame
+        # height for SD if the header can't be read).
+        dv_height = int(v_stream.get('coded_height') or v_stream.get('height', 0))
+        dv_system = read_dv_system(file_path)
+        system_source = "DV frame header"
+        if dv_system is None and dv_height in (480, 486, 576):
+            dv_system = '625/50' if dv_height == 576 else '525/60'
+            system_source = "frame height"
+        if dv_system:
+            nominal = dv_nominal_fps(dv_system, dv_height)
+            if abs(fps - nominal) > 0.01:
+                fps_note = (f"container reported {fps:.2f} fps — using DV system rate {nominal:.2f} fps "
+                            f"({dv_system}, from {system_source})")
+                fps = nominal
     total_frames = int(v_stream.get('nb_frames', 0))
     if total_frames == 0:
         total_frames = int(duration * fps)
@@ -396,11 +651,27 @@ def get_video_info(file_path: Path, warn: bool = True) -> VideoInfo:
     # Detect interlacing
     field_order = v_stream.get('field_order', 'progressive')
     interlaced = field_order not in ['progressive', 'unknown']
+    field_order_source, field_order_detail = 'stream', field_order
+    if 'field_order' not in v_stream or field_order == 'unknown':
+        # Stream-level field order absent — fall back to first-frame metadata
+        # rather than silently assuming progressive (GitHub issue #9).
+        frame_order = detect_field_order_from_frames(file_path)
+        if frame_order is None:
+            field_order_source, field_order_detail = 'none', ''
+        else:
+            field_order_source, field_order_detail = 'frames', frame_order
+            interlaced = frame_order in ('tff', 'bff')
 
     # VFR detection: r_frame_rate (the stream's nominal/guessed rate) diverging
     # from avg_frame_rate (total_frames/duration) indicates the source is not CFR.
     r_fps = _parse_frame_rate(v_stream.get('r_frame_rate', '0/1'))
     is_vfr = r_fps > 0 and fps > 0 and abs(r_fps - fps) > 0.05
+    if fps_note:
+        # The container's rate fields were shown to be meaningless for this DV
+        # source, so comparing them says nothing about VFR. The per-packet
+        # duration check (detect_variable_packet_durations) still runs for
+        # -v210/-ffv1 and catches real dropped or held frames.
+        is_vfr = False
 
     # Use coded (full sample buffer) dimensions rather than display dimensions —
     # macOS FFmpeg 7.x+ honors QuickTime clap clean aperture atoms and reports
@@ -412,6 +683,8 @@ def get_video_info(file_path: Path, warn: bool = True) -> VideoInfo:
     height = int(v_stream.get('coded_height') or display_height)
 
     logger = logging.getLogger('video_transcoder')
+    if warn and fps_note:
+        logger.warning(f"{file_path.name}: DV frame rate misreported by container — {fps_note}")
     if warn and (width, height) != (display_width, display_height):
         logger.warning(f"{file_path.name}: coded dimensions {width}x{height} differ from "
                        f"reported display dimensions {display_width}x{display_height}")
@@ -439,7 +712,9 @@ def get_video_info(file_path: Path, warn: bool = True) -> VideoInfo:
         width=width, height=height, duration=duration,
         fps=fps, dar=v_stream.get('display_aspect_ratio', '4:3'), has_audio=a_stream is not None,
         total_frames=total_frames, codec=v_stream.get('codec_name', 'unknown'),
-        interlaced=interlaced, is_vfr=is_vfr, is_quicktime=is_quicktime
+        interlaced=interlaced, is_vfr=is_vfr, is_quicktime=is_quicktime,
+        field_order_source=field_order_source, field_order_detail=field_order_detail,
+        fps_note=fps_note
     )
 
 def detect_video_standard(width: int, height: int, fps: float) -> VideoStandard:
@@ -610,7 +885,8 @@ def run_mediaconch_check(output_path: Path, policy_xml: str, policy_filename: st
                 pass
 def validate_v210_lossless(source_path: Path, output_path: Path, process_log: Path,
                            log_dir: Path, keep_framemd5: bool, keep_mediaconch: bool,
-                           video_standard: VideoStandard, clean_aperture: bool = False) -> Tuple[bool, str]:
+                           video_standard: VideoStandard, clean_aperture: bool = False,
+                           has_audio: bool = True) -> Tuple[bool, str]:
     logger = logging.getLogger('video_transcoder')
     try:
         temp_dir = output_path.parent / "temp_framemd5"
@@ -656,7 +932,10 @@ def validate_v210_lossless(source_path: Path, output_path: Path, process_log: Pa
 
         logger.info(f"  ✓ Video validation passed: {frame_count} frames match")
 
-        logger.info("  → Generating hash for source audio stream(s)...")
+        if not has_audio:
+            logger.info("  → No audio stream in source — video-only validation")
+        else:
+            logger.info("  → Generating hash for source audio stream(s)...")
         cmd_source_audio = ['ffmpeg', '-i', str(source_path), '-map', '0:a', '-f', 'streamhash', '-hash', 'md5', '-']
         success, source_audio_hash = run_validation_command_with_spinner(cmd_source_audio, "Hashing source audio", process_log)
         audio_passed = False
@@ -664,7 +943,8 @@ def validate_v210_lossless(source_path: Path, output_path: Path, process_log: Pa
         output_audio_hash = ""
         if not success:
             with open(process_log, 'a') as log_f:
-                log_f.write("Audio validation skipped: no audio stream or failed to hash source\n")
+                log_f.write("Audio validation skipped: no audio stream in source\n" if not has_audio else
+                            "Audio validation skipped: no audio stream or failed to hash source\n")
         else:
             cmd_output_audio = ['ffmpeg', '-i', str(output_path), '-map', '0:a', '-f', 'streamhash', '-hash', 'md5', '-']
             success, output_audio_hash = run_validation_command_with_spinner(cmd_output_audio, "Hashing output audio", process_log)
@@ -684,6 +964,8 @@ def validate_v210_lossless(source_path: Path, output_path: Path, process_log: Pa
             log_f.write("\nFRAMEMD5 DIGEST\n" + "-" * 40 + "\n")
             log_f.write(f"Frames compared:    {frame_count}\n")
             log_f.write(f"Video result:       PASS — all {frame_count} frames match\n")
+            if not has_audio:
+                log_f.write("Audio result:       N/A — no audio stream in source\n")
             if audio_passed:
                 log_f.write(f"Audio source hash:  {source_audio_hash}\n")
                 log_f.write(f"Audio output hash:  {output_audio_hash}\n")
@@ -785,6 +1067,22 @@ def generate_thumbnail(source_path: Path, output_path: Path, timestamp: float, s
     success, output = run_ffmpeg_with_progress(cmd, 1, desc, log_file)
     return success
 
+# Audio resync used in the separate H.264 audio mux step (GitHub issue #10).
+AUDIO_ASYNC_FILTER = "aresample=async=1:min_hard_comp=0.100000:first_pts=0"
+
+def add_audio_async_filter(audio_filter_args: List[str]) -> List[str]:
+    """Add AUDIO_ASYNC_FILTER to the audio filter args from
+    build_audio_filter_and_mapping(), preserving whatever is already there
+    (pan, dynaudnorm ceiling, mono-merge filter_complex)."""
+    if not audio_filter_args:
+        return ["-af", AUDIO_ASYNC_FILTER]
+    if audio_filter_args[0] == "-af":
+        return ["-af", f"{AUDIO_ASYNC_FILTER},{audio_filter_args[1]}"] + audio_filter_args[2:]
+    if audio_filter_args[0] == "-filter_complex" and audio_filter_args[1].endswith("[aout]"):
+        fc = audio_filter_args[1][:-len("[aout]")] + f",{AUDIO_ASYNC_FILTER}[aout]"
+        return ["-filter_complex", fc] + audio_filter_args[2:]
+    return audio_filter_args
+
 def cleanup_temp_files(prefix: Path):
     for ext in ["-0.log", "-0.log.mbtree"]:
         temp_file = Path(str(prefix) + ext)
@@ -842,14 +1140,42 @@ def process_h264_output(source_path: Path, output_path: Path, info: VideoInfo, c
         if not success:
             return False
         
-        pass2_cmd = ["ffmpeg", "-y", "-i", str(source_path)] + video_mapping
-        pass2_cmd += audio_mapping
-        if audio_filter_args:
-            pass2_cmd += audio_filter_args
-        pass2_cmd += video_codec_args + ["-pass", "2", "-passlogfile", str(stats_log_prefix), "-tune", "film"] + audio_codec_args + ["-movflags", "faststart", str(output_path)]
-        success, _ = run_ffmpeg_with_progress(pass2_cmd, info.total_frames, f"H264 Pass 2: {source_path.name[:20]}", process_log)
-        if not success:
-            return False
+        pass2_video_args = video_codec_args + ["-pass", "2", "-passlogfile", str(stats_log_prefix), "-tune", "film"]
+        if not info.has_audio:
+            pass2_cmd = ["ffmpeg", "-y", "-i", str(source_path)] + video_mapping + pass2_video_args + \
+                        ["-an", "-movflags", "faststart", str(output_path)]
+            success, _ = run_ffmpeg_with_progress(pass2_cmd, info.total_frames, f"H264 Pass 2: {source_path.name[:20]}", process_log)
+            if not success:
+                return False
+        else:
+            # GitHub issue #10: encoding video (slow x264) and audio (near-instant
+            # AAC) in the same ffmpeg process silently dropped audio partway through
+            # long files (e.g. ~35 min into long Premiere ProRes HQ exports) —
+            # regardless of edit-list, resample or interleave fixes. So pass 2
+            # encodes video only, to a temp file, and a separate step muxes that
+            # (stream-copied) video with freshly decoded audio, where both streams
+            # produce packets at comparable speed.
+            temp_video = stats_log_prefix.parent / f"{output_path.stem}_video_tmp.mp4"
+            pass2_cmd = ["ffmpeg", "-y", "-i", str(source_path)] + video_mapping + pass2_video_args + \
+                        ["-an", str(temp_video)]
+            success, _ = run_ffmpeg_with_progress(pass2_cmd, info.total_frames, f"H264 Pass 2: {source_path.name[:20]}", process_log)
+            if not success:
+                logging.getLogger('video_transcoder').error(
+                    f"H264 pass 2 failed — audio mux skipped; partial video left for inspection: {temp_video}")
+                return False
+            mux_cmd = ["ffmpeg", "-y", "-i", str(source_path), "-i", str(temp_video), "-map", "1:v:0"]
+            mux_cmd += audio_mapping + add_audio_async_filter(audio_filter_args)
+            mux_cmd += ["-c:v", "copy"] + audio_codec_args + \
+                       ["-max_interleave_delta", "0", "-movflags", "faststart", str(output_path)]
+            success, _ = run_ffmpeg_with_progress(mux_cmd, info.total_frames, f"H264 Audio Mux: {source_path.name[:20]}", process_log)
+            if not success:
+                logging.getLogger('video_transcoder').error(
+                    f"H264 audio mux failed — video-only encode left for inspection: {temp_video}")
+                return False
+            try:
+                temp_video.unlink()
+            except Exception as e:
+                logging.getLogger('video_transcoder').warning(f"Failed to delete {temp_video}: {e}")
         
         if not config.skip_validation:
             is_valid, err_msg = validate_output(output_path)
@@ -857,21 +1183,45 @@ def process_h264_output(source_path: Path, output_path: Path, info: VideoInfo, c
                 logging.getLogger('video_transcoder').error(f"H264 validation failed: {err_msg}")
                 return False
         
-        if config.thumb_count is not None:
-            num_thumbs = config.thumb_count
-            positions = sorted([random.uniform(0.05, 0.95) for _ in range(num_thumbs)])
-        else:
-            num_thumbs = len(THUMBNAIL_POSITIONS)
-            positions = THUMBNAIL_POSITIONS
-        time_points = [info.duration * pos for pos in positions]
-        for idx, timestamp in enumerate(time_points, 1):
-            thumb_path = output_path.parent / f"{thumbnail_prefix}_thumb_{idx}.jp2"
-            success = generate_thumbnail(source_path, thumb_path, timestamp, scale_string, idx, len(time_points), info.interlaced, parity, process_log)
-            if not success:
-                return False
-        return True
+        return generate_thumbnail_set(source_path, output_path.parent, thumbnail_prefix, info, config,
+                                      scale_string, parity, process_log)
     except Exception as e:
         logging.getLogger('video_transcoder').error(f"H264 processing error: {e}")
+        return False
+
+def generate_thumbnail_set(source_path: Path, output_dir: Path, thumbnail_prefix: str, info: VideoInfo, config: Config,
+                           scale_string: str, parity: int, process_log: Path) -> bool:
+    """Generate the full set of JP2 thumbnails for one source: 4 at standard
+    positions by default, or --thumbs N at random positions."""
+    if config.thumb_count is not None:
+        num_thumbs = config.thumb_count
+        positions = sorted([random.uniform(0.05, 0.95) for _ in range(num_thumbs)])
+    else:
+        num_thumbs = len(THUMBNAIL_POSITIONS)
+        positions = THUMBNAIL_POSITIONS
+    time_points = [info.duration * pos for pos in positions]
+    for idx, timestamp in enumerate(time_points, 1):
+        thumb_path = output_dir / f"{thumbnail_prefix}_thumb_{idx}.jp2"
+        success = generate_thumbnail(source_path, thumb_path, timestamp, scale_string, idx, len(time_points), info.interlaced, parity, process_log)
+        if not success:
+            return False
+    return True
+
+def process_thumbnails_only(source_path: Path, info: VideoInfo, config: Config, process_log: Path, thumbnail_prefix: str) -> bool:
+    """Thumbnail-only mode: same scaling, deinterlacing and field order as the
+    thumbnails generated alongside -h264 output, but no video encode."""
+    try:
+        scale_string = calculate_scaling_params(info.width, info.height, info.dar, config.force_anamorphic)
+        if info.interlaced:
+            parity = {'tff': 0, 'bff': 1}.get(config.force_scan, -1)
+        else:
+            parity = -1
+        with open(process_log, 'a') as log_f:
+            log_f.write(f"Interlaced: {info.interlaced}\n")
+        return generate_thumbnail_set(source_path, config.output_dir, thumbnail_prefix, info, config,
+                                      scale_string, parity, process_log)
+    except Exception as e:
+        logging.getLogger('video_transcoder').error(f"Thumbnail processing error: {e}")
         return False
 
 def clean_aperture_input_args(clean_aperture: bool) -> List[str]:
@@ -922,14 +1272,15 @@ def process_v210_output(source_path: Path, output_path: Path, info: VideoInfo, v
                "-color_primaries", "smpte170m", "-color_trc", "bt709", "-colorspace", "smpte170m",
                "-color_range", "mpeg", "-metadata:s:v:0", "encoder=Uncompressed 10-bit 4:2:2",
                "-vf", f"setfield={setfield},setsar={setsar},setdar=4/3",
-               "-c:a", "pcm_s24le", "-map", "0:v", "-map", "0:a", "-f", "mov", str(output_path)]
+               # 0:a? — optional, so sources with no audio track don't fail the encode
+               "-c:a", "pcm_s24le", "-map", "0:v", "-map", "0:a?", "-f", "mov", str(output_path)]
         success, _ = run_ffmpeg_with_progress(cmd, info.total_frames, f"v210: {source_path.name[:20]}", process_log)
         if not success:
             return False
         logger.info(f"Starting framemd5 lossless validation for {source_path.name}")
         is_valid, validation_msg = validate_v210_lossless(
             source_path, output_path, process_log, log_dir,
-            keep_framemd5, keep_mediaconch, video_standard, clean_aperture)
+            keep_framemd5, keep_mediaconch, video_standard, clean_aperture, info.has_audio)
         if not is_valid:
             logger.error(f"v210 lossless validation FAILED: {validation_msg}")
             handle_failed_lossless_output(output_path, keep_failed)
@@ -943,7 +1294,7 @@ def process_prores_output(source_path: Path, output_path: Path, info: VideoInfo,
     try:
         cmd = ["ffmpeg", "-y", "-i", str(source_path), "-codec:v", "prores_ks", "-profile:v", "3",
                "-vtag", "apch", "-metadata:s", "encoder=Apple ProRes 422 HQ", "-vendor", "apl0",
-               "-codec:a", "copy", "-map", "0:v", "-map", "0:a", str(output_path)]
+               "-codec:a", "copy", "-map", "0:v", "-map", "0:a?", str(output_path)]
         success, _ = run_ffmpeg_with_progress(cmd, info.total_frames, f"ProRes: {source_path.name[:20]}", process_log)
         return success
     except Exception as e:
@@ -952,7 +1303,7 @@ def process_prores_output(source_path: Path, output_path: Path, info: VideoInfo,
 
 def validate_ffv1_lossless(source_path: Path, output_path: Path, process_log: Path,
                            log_dir: Path, keep_framemd5: bool, keep_mediaconch: bool,
-                           clean_aperture: bool = False) -> Tuple[bool, str]:
+                           clean_aperture: bool = False, has_audio: bool = True) -> Tuple[bool, str]:
     """Framemd5 + audio streamhash validation for FFV1 output, with digest logging,
     optional framemd5 file retention, and MediaConch policy check."""
     logger = logging.getLogger('video_transcoder')
@@ -1000,7 +1351,10 @@ def validate_ffv1_lossless(source_path: Path, output_path: Path, process_log: Pa
 
         logger.info(f"  ✓ Video validation passed: {frame_count} frames match")
 
-        logger.info("  → Generating hash for source audio stream(s)...")
+        if not has_audio:
+            logger.info("  → No audio stream in source — video-only validation")
+        else:
+            logger.info("  → Generating hash for source audio stream(s)...")
         cmd_source_audio = ['ffmpeg', '-i', str(source_path), '-map', '0:a', '-f', 'streamhash', '-hash', 'md5', '-']
         success, source_audio_hash = run_validation_command_with_spinner(cmd_source_audio, "Hashing source audio", process_log)
         audio_passed = False
@@ -1008,7 +1362,8 @@ def validate_ffv1_lossless(source_path: Path, output_path: Path, process_log: Pa
         output_audio_hash = ""
         if not success:
             with open(process_log, 'a') as log_f:
-                log_f.write("Audio validation skipped: no audio stream or failed to hash source\n")
+                log_f.write("Audio validation skipped: no audio stream in source\n" if not has_audio else
+                            "Audio validation skipped: no audio stream or failed to hash source\n")
         else:
             cmd_output_audio = ['ffmpeg', '-i', str(output_path), '-map', '0:a', '-f', 'streamhash', '-hash', 'md5', '-']
             success, output_audio_hash = run_validation_command_with_spinner(cmd_output_audio, "Hashing output audio", process_log)
@@ -1028,6 +1383,8 @@ def validate_ffv1_lossless(source_path: Path, output_path: Path, process_log: Pa
             log_f.write("\nFRAMEMD5 DIGEST\n" + "-" * 40 + "\n")
             log_f.write(f"Frames compared:    {frame_count}\n")
             log_f.write(f"Video result:       PASS — all {frame_count} frames match\n")
+            if not has_audio:
+                log_f.write("Audio result:       N/A — no audio stream in source\n")
             if audio_passed:
                 log_f.write(f"Audio source hash:  {source_audio_hash}\n")
                 log_f.write(f"Audio output hash:  {output_audio_hash}\n")
@@ -1095,7 +1452,7 @@ def process_ffv1_output(source_path: Path, output_path: Path, info: VideoInfo,
         cmd = [
             "ffmpeg", "-y"] + clean_aperture_input_args(clean_aperture) + [
             "-i", str(source_path),
-            "-map", "0:v", "-map", "0:a",
+            "-map", "0:v", "-map", "0:a?",  # optional — sources with no audio track
             "-c:v", "ffv1", "-level", "3", "-g", "1", "-slices", "16", "-slicecrc", "1",
         ] + vendor_metadata + [
             "-c:a", "copy",
@@ -1106,7 +1463,8 @@ def process_ffv1_output(source_path: Path, output_path: Path, info: VideoInfo,
             return False
         logger.info(f"Starting framemd5 lossless validation for {source_path.name}")
         is_valid, validation_msg = validate_ffv1_lossless(
-            source_path, output_path, process_log, log_dir, keep_framemd5, keep_mediaconch, clean_aperture)
+            source_path, output_path, process_log, log_dir, keep_framemd5, keep_mediaconch, clean_aperture,
+            info.has_audio)
         if not is_valid:
             logger.error(f"FFV1 lossless validation FAILED: {validation_msg}")
             handle_failed_lossless_output(output_path, keep_failed)
@@ -1159,10 +1517,12 @@ def process_single_video(source_path: Path, config: Config, completed_set: Set[s
     else:
         output_paths['ffv1'] = None
     
-    thumbnail_prefix = base_stem if config.output_h264 else None
+    thumbnail_prefix = base_stem if (config.output_h264 or config.thumbs_only) else None
     num_thumbs = config.thumb_count if config.thumb_count is not None else len(THUMBNAIL_POSITIONS)
     derivatives_exist = verify_derivatives_exist(output_paths, thumbnail_prefix if thumbnail_prefix else "", num_thumbs)
-    if base_name in completed_set and derivatives_exist:
+    # Thumbnail-only runs always regenerate — they're meant to replace thumbnails
+    # for files that have already been processed.
+    if base_name in completed_set and derivatives_exist and not config.thumbs_only:
         return ProcessingResult(base_name, ProcessStatus.SKIPPED, "N/A", "Already processed", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     
     process_log = config.log_dir / f"{root_name}_process.log"
@@ -1214,13 +1574,42 @@ def process_single_video(source_path: Path, config: Config, completed_set: Set[s
         
         # Log interlacing status to terminal
         interlace_status = "interlaced" if info.interlaced else "progressive"
+        if config.force_scan is None:
+            if info.field_order_source == 'frames':
+                interlace_status += (f", {info.field_order_detail.upper()}" if info.interlaced else "") + \
+                    " — from first-frame metadata, no stream field order"
+            elif info.field_order_source == 'none':
+                interlace_status += " — assumed, no field order metadata"
+                logger.warning(f"{base_name}: no field order in stream or frame metadata — treating as "
+                               f"progressive. Use --force-scan tff/bff if the source is interlaced")
         logger.info(f"Source: {info.width}x{info.height} @ {info.fps:.2f}fps ({interlace_status})")
+        mediainfo_summary = get_mediainfo_summary(source_path)
+        if mediainfo_summary:
+            logger.info(f"MediaInfo — {base_name}\n" + "\n".join(mediainfo_summary) + "\n")
+        else:
+            logger.warning(f"MediaInfo summary unavailable for {base_name}")
         
-        with open(process_log, 'w') as log_f:
+        # Thumbnail-only runs append, so the original transcode's process log
+        # (commands, framemd5 digests, validation results) is never overwritten.
+        with open(process_log, 'a' if config.thumbs_only else 'w') as log_f:
+            if config.thumbs_only:
+                log_f.write(f"\n{SCRIPT_SEPARATOR}\nTHUMBNAIL-ONLY RUN — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             log_f.write(SCRIPT_TITLE + "\n" + SCRIPT_NAME + "\n" + SCRIPT_SEPARATOR + "\n" + SCRIPT_SEPARATOR + "\n\n")
             log_f.write(f"Processing: {base_name}\nSource: {info.width}x{info.height} @ {info.fps:.2f}fps\n")
-            log_f.write(f"Video Standard: {video_standard.value}\nOutput Formats: {', '.join([k for k, v in output_paths.items() if v])}\n\n")
+            log_f.write(f"Scan: {interlace_status}\n")
+            if info.fps_note:
+                log_f.write(f"Frame rate: {info.fps_note}\n")
+            if mediainfo_summary:
+                log_f.write("\nMediaInfo:\n" + "\n".join(mediainfo_summary) + "\n\n")
+            log_f.write(f"Video Standard: {video_standard.value}\nOutput Formats: {'thumbnails only' if config.thumbs_only else ', '.join([k for k, v in output_paths.items() if v])}\n\n")
         
+        if config.thumbs_only:
+            logger.info(f"Generating {config.thumb_count} thumbnail(s) for {base_name}")
+            if not process_thumbnails_only(source_path, info, config, process_log, thumbnail_prefix):
+                raise Exception("Thumbnail generation failed")
+            return ProcessingResult(base_name, ProcessStatus.SUCCESS, audio_status,
+                                    f"Thumbnails generated ({config.thumb_count})",
+                                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         if config.output_h264:
             logger.info(f"Encoding H.264 for {base_name}")
             if not process_h264_output(source_path, output_paths['h264'], info, config, process_log, stats_log_prefix, thumbnail_prefix):
@@ -1436,7 +1825,8 @@ def process_batch(config: Config) -> ProcessingStats:
             with tqdm(total=len(files), unit="file", desc="Total Progress", position=0) as pbar:
                 for future in as_completed(futures):
                     result = future.result()
-                    log_to_csv(config.csv_log, result, config.dry_run)
+                    if not config.thumbs_only:
+                        log_to_csv(config.csv_log, result, config.dry_run)
                     if result.status == ProcessStatus.SUCCESS:
                         stats.success += 1
                         session_completed.add(result.source_file)
@@ -1458,7 +1848,8 @@ def process_batch(config: Config) -> ProcessingStats:
         with tqdm(total=len(files), unit="file", desc="Total Progress", position=0) as pbar:
             for file_path in files:
                 result = process_single_video(file_path, config, completed_set, filename_disambiguation)
-                log_to_csv(config.csv_log, result, config.dry_run)
+                if not config.thumbs_only:
+                    log_to_csv(config.csv_log, result, config.dry_run)
                 if result.status == ProcessStatus.SUCCESS:
                     stats.success += 1
                     session_completed.add(result.source_file)
@@ -1512,7 +1903,8 @@ def parse_arguments() -> argparse.Namespace:
                              'MediaConch) instead of deleting them, renamed with a _VALIDATION_FAILED suffix for '
                              'inspection. Default is to delete failed output.')
     parser.add_argument('--thumbs', type=int, default=None,
-                        help='Number of thumbnails to generate (default: 4 at standard positions, override uses random positions)')
+                        help='Number of thumbnails to generate (default: 4 at standard positions, override uses random positions). '
+                             'Pass --thumbs N with no format flag to generate thumbnails only (no video derivative).')
     parser.add_argument('-h264', action='store_true', help='Generate H.264 MP4 output with thumbnails (_sl.mp4)')
     parser.add_argument('-v210', action='store_true', help='Generate v210 uncompressed 10-bit 4:2:2 QuickTime output (.mov)')
     parser.add_argument('-prores', action='store_true', help='Generate ProRes 422 HQ QuickTime output (_sh.mov)')
@@ -1540,12 +1932,17 @@ def main():
     try:
         config = Config(args)
         logger = setup_logging(config.log_dir, config.dry_run)
+        for notice in config.setup_notices:
+            logger.warning(notice)
         if not check_dependencies():
             logger.error("Missing required dependencies. Exiting.")
             sys.exit(1)
         if not config.dry_run:
             check_disk_space(config.output_dir)
         logger.info("Starting video transcoding pipeline")
+        if config.thumbs_only:
+            logger.info(f"Thumbnail-only mode: {config.thumb_count} thumbnail(s) per file at random positions — "
+                        f"no video derivatives, sources left in place, not recorded in the resume CSV")
         if config.output_h264:
             # AAC is only relevant to the H.264 path (v210/FFV1 audio is PCM copy,
             # not AAC-encoded) — logging it unconditionally is misleading on
@@ -1554,6 +1951,9 @@ def main():
         stats = process_batch(config)
         if stats.error > 0:
             sys.exit(1)
+    except ConfigError as e:
+        print(f"{Colors.RED}{Colors.BOLD}ERROR:{Colors.RESET} {Colors.RED}{e}{Colors.RESET}\n")
+        sys.exit(2)
     except KeyboardInterrupt:
         print("\n\nProcessing interrupted by user")
         sys.exit(130)

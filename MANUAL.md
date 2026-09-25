@@ -47,11 +47,25 @@ Four output formats are available: `-h264`, `-v210`, `-prores`, `-ffv1`. At leas
 |------|---------|
 | `ffmpeg` | All encoding, filtering, hashing, and thumbnail generation |
 | `ffprobe` | Source file metadata detection |
+| `mediainfo` | Per-file technical metadata summary (MediaInfo CLI) |
 | Python 3.10+ | Runtime |
 | `tqdm` | Progress bar display |
 | `mediaconch` | *(Optional)* Policy conformance checks on `-v210`/`-ffv1` output |
 
-`ffmpeg` and `ffprobe` must be present in `PATH`. The script checks for them at startup and exits if either is missing. `mediaconch` is checked separately — if it's missing, `vdg` logs a warning and skips policy conformance checks for the run rather than exiting.
+`ffmpeg`, `ffprobe` and `mediainfo` must be present in `PATH`. The script checks for them at startup and exits if any is missing. `mediaconch` is checked separately — if it's missing, `vdg` logs a warning and skips policy conformance checks for the run rather than exiting.
+
+### Supported FFmpeg versions
+
+| Platform | FFmpeg | How it's installed |
+|----------|--------|--------------------|
+| macOS (Apple Silicon) | 7.1.x | Homebrew `ffmpeg@7`, pinned with `brew pin ffmpeg@7`, first on `PATH` |
+| Ubuntu 24.04 | 6.1.x | Stock Ubuntu `ffmpeg` package, held with `apt-mark hold ffmpeg` |
+
+**FFmpeg 9.x is not supported.** On macOS it has broken ffprobe JSON parsing and FFV1 → v210 lossless transcodes (framemd5 validation failures). Newer FFmpeg releases will be adopted only after they've been tested against lossless FFV1/v210 round-trips on both platforms. See [INSTALL_MACOS.md](INSTALL_MACOS.md) and [INSTALL_UBUNTU.md](INSTALL_UBUNTU.md) for installation and pinning.
+
+At startup, `vdg` logs the FFmpeg version and path it's using, in both the terminal and the session log. It warns without stopping the run if: FFmpeg is newer than the tested major version (7.x); the release version can't be determined (e.g. a git snapshot build); or `ffmpeg` and `ffprobe` report different versions (usually a `PATH` problem). The tested ceiling is set by `MAX_TESTED_FFMPEG_MAJOR` in `vdg/cli.py`.
+
+Check which FFmpeg `vdg` will use with `which ffmpeg && ffmpeg -version | head -1`.
 
 **AAC encoder autodetection:** The script probes for AAC encoders at startup in priority order: `aac_at` (macOS AudioToolbox, preferred) → `libfdk_aac` → `aac` (FFmpeg native). The selected encoder is logged and used for all H.264 output in that session. This is only logged when `-h264` is requested — on lossless-only runs (`-v210`/`-ffv1`), audio is copied (PCM/native), not AAC-encoded, so logging an AAC encoder in that case would be misleading.
 
@@ -65,7 +79,7 @@ Source files are FFV1-encoded MKV containers produced by the SMPL tape digitizat
 
 Supported source formats: Betacam SP, Digital Betacam, VHS, U-matic, Hi8, DV
 
-**DV note:** DV content is captured and packaged using dvrescue (MIPoPS). dvrescue-packaged DV-in-MKV files can present unreliable container metadata — in particular, ffprobe may misread the frame rate. Use `--force-fps 29.97` and `--force-scan bff` when processing standard NTSC DV sources from this workflow.
+**DV note:** DV content is captured and packaged using dvrescue (MIPoPS). dvrescue-packaged DV-in-MKV files can present unreliable container metadata — in particular, ffprobe may misread the frame rate. The frame rate is now corrected automatically from the DV frame header (see [DV frame rate correction](#dv-frame-rate-correction)); `--force-fps 29.97` remains available as an override. DV sources usually have no stream-level field order either, but `vdg` now falls back to the field order in the first frames (see [`--force-scan`](#--force-scan)). Keeping `--force-scan bff` on DV runs is still a harmless safeguard.
 
 **v210 output is restricted to SD sources** that resolve to a recognized NTSC or PAL video standard (see [Scaling and Resolution Handling](#scaling-and-resolution-handling)). Attempting to generate v210 from a source that doesn't resolve to NTSC or PAL raises an error before encoding starts. **`-prores` and `-ffv1` are not restricted by video standard** — both encode at the source's native dimensions with no scaling filter applied, so they run against SD or HD sources equally.
 
@@ -93,6 +107,14 @@ Two-pass H.264 encode targeting the `main` profile. JPEG 2000 thumbnails are gen
 Interlaced sources are deinterlaced using `bwdif` before encoding. Progressive sources pass through without deinterlacing.
 
 Audio: AAC stereo, 48 kHz, 128 kbps. See [Audio Configuration](#audio-configuration) for channel routing options.
+
+**Encode steps:** video and audio are never encoded in the same ffmpeg process:
+
+1. **Pass 1**: x264 analysis pass, video only.
+2. **Pass 2**: x264 final encode, video only, written to `process_logs/<base>_sl_video_tmp.mp4`.
+3. **Audio mux**: the pass-2 video is stream-copied (not re-encoded) into the final MP4, and the audio is decoded, filtered and AAC-encoded from the source. `aresample=async=1:min_hard_comp=0.1:first_pts=0` is applied ahead of any `--audio-mode`/`--clip-ceiling` filters, and `-max_interleave_delta 0` is passed to the muxer.
+
+This split fixes audio dropping out partway through long files, observed around 35 minutes into long Premiere ProRes HQ exports ([issue #10](https://github.com/Stanford-Media-Preservation-Lab/vdg/issues/10)). When slow x264 video and near-instant AAC audio were encoded in one process, the audio went silent while the video kept playing and the file duration still looked correct. The temp video is deleted after a successful mux. If pass 2 or the mux fails, it's left in `process_logs/` for inspection. Sources with no audio skip the mux step: pass 2 writes the final file directly.
 
 Output filename: `<base>_sl.mp4`
 
@@ -205,6 +227,27 @@ vdg --source-dir ... --output-dir ... --force-anamorphic -h264
 
 Sources with frame rates above the standard threshold for their standard (>30 fps for NTSC, >25 fps for PAL) are halved on H.264 output. This handles 50i/60i sources correctly.
 
+### DV frame rate correction
+
+DV's frame rate is fixed by its signal system, and every DV frame header records that system: 525/60 (NTSC family) or 625/50 (PAL family). Raw `.dv` files, and MKVs built from raw DV (e.g. by dvrescue), have no real container timing, so ffprobe's frame rate fields can come out nonsensical: 60,000 fps, 30,000 fps, or hundreds of fps.
+
+For every `dvvideo` source, `vdg` reads the DSF flag from the first DV frame's header, in any container, and derives the true rate:
+
+| DV system | SD, DVCPRO HD 1080i | DVCPRO HD 720p |
+|-----------|---------------------|----------------|
+| 525/60 | 29.97 | 59.94 |
+| 625/50 | 25 | 50 |
+
+If the container-reported rate disagrees, `vdg` uses the DV rate and logs a warning, which is also recorded in the process log:
+
+```
+WARNING: ab111cd2222_pm.dv: DV frame rate misreported by container — container reported 60000.00 fps — using DV system rate 29.97 fps (525/60, from DV frame header)
+```
+
+If the header can't be read, SD frame height is used instead (480/486 means 525/60, 576 means 625/50). For corrected sources, the whole-file average-rate VFR check below is skipped, because the container's rate fields have just been shown to be meaningless. The per-packet duration check still runs and catches real dropped or held frames. Without this correction, raw DV sent to `-ffv1` was falsely quarantined as VFR, and H.264 encodes failed at absurd output rates. `--force-fps` still overrides the corrected rate if passed. Non-DV sources are unaffected.
+
+This corrects misreported *rate fields*. If a DV file's timestamps are also wrong, its duration will be wrong too; check the MediaInfo summary's `Duration` against the capture length.
+
 ### Variable frame rate (VFR) detection
 
 `-v210` and `-ffv1` requests trigger an additional VFR check before encoding, because lossless roundtrip (framemd5) validation assumes constant frame timing and is unreliable against a genuinely VFR source. Two independent checks are combined — either one firing is sufficient to flag the source:
@@ -308,6 +351,8 @@ A warning is logged at the start of a run reporting how many unique IDs were aff
 | `-v210` | v210 uncompressed 10-bit 4:2:2 QuickTime (SD only) |
 | `-prores` | ProRes 422 HQ QuickTime (native resolution) |
 | `-ffv1` | FFV1 v3 lossless MKV (native resolution) |
+
+Exception: `--thumbs N` on its own, with no format flag, runs [thumbnails-only mode](#thumbnails-only).
 
 ### General flags
 
@@ -413,7 +458,15 @@ This flag is intended for overmodulated camera audio where the source recording 
 
 ### `--force-scan`
 
-Overrides ffprobe's field order detection. Choices: `progressive`, `tff`, `bff`.
+Overrides field order detection. Choices: `progressive`, `tff`, `bff`.
+
+**How detection works without the override:**
+
+1. The stream-level `field_order` reported by ffprobe is used when present.
+2. If it's missing or `unknown`, `vdg` reads the `interlaced_frame`/`top_field_first` flags from the first 5 frames, decides by majority, and logs the result: `Source: 720x480 @ 29.97fps (interlaced, BFF — from first-frame metadata, no stream field order)`. This catches DV sources (raw `.dv` and dvrescue DV-in-MKV), where the field order exists only at the codec level. Before v1.5 those were silently treated as progressive, which left combing in the H.264 output.
+3. If neither source has field order metadata, the file is treated as progressive and a warning suggests `--force-scan`.
+
+The scan type and its source are also written to the per-file process log (`Scan:` line). The MediaInfo summary's `Scan type`/`Scan order` gives an independent cross-check.
 
 | Value | Effect |
 |-------|--------|
@@ -421,7 +474,7 @@ Overrides ffprobe's field order detection. Choices: `progressive`, `tff`, `bff`.
 | `tff` | Force top-field-first deinterlacing |
 | `bff` | Force bottom-field-first deinterlacing |
 
-Standard NTSC DV is bottom-field-first. Use `--force-scan bff` when processing DV sources from dvrescue/dvpackager whose container metadata ffprobe misreads.
+Standard NTSC DV is bottom-field-first. The first-frame fallback normally detects this on its own. Use `--force-scan bff` if a DV source's frames carry no field flags either, or as a safeguard.
 
 ### `--force-fps`
 
@@ -432,7 +485,7 @@ Overrides ffprobe's frame rate detection. Accepts a float value.
 --force-fps 25
 ```
 
-This flag is applied before video standard detection, so it correctly propagates to GOP calculation, output frame rate, progress bar frame count, and NTSC/PAL classification. Use when processing dvrescue-packaged DV-in-MKV files where ffprobe may misread the frame rate from container metadata (e.g., reporting 30,000 fps).
+This flag is applied before video standard detection, so it correctly propagates to GOP calculation, output frame rate, progress bar frame count, and NTSC/PAL classification. DV sources are now corrected automatically (see [DV frame rate correction](#dv-frame-rate-correction)), so `--force-fps` is mainly for non-DV sources whose container misreports the rate, or as a safeguard.
 
 Both `--force-fps` and `--force-scan` can be used together.
 
@@ -456,6 +509,21 @@ Thumbnails are scaled to the same output resolution as the H.264 derivative (inc
 **Technical specifications:** 8-bit RGB, JPEG 2000 compression, encoded via `libopenjpeg` (chosen over the native `jpeg2000` encoder, which maps to 9-bit sYCC regardless of input format).
 
 **Naming:** `<base>_thumb_1.jp2`, `<base>_thumb_2.jp2`, etc.
+
+### Thumbnails only
+
+Pass `--thumbs N` with **no** format flag to regenerate thumbnails without encoding a video derivative — e.g. when none of the original thumbnails are usable:
+
+```bash
+vdg --source-dir /Volumes/disk/1/source/finished_sources --output-dir /Volumes/disk/1/output --thumbs 30
+```
+
+- N thumbnails are taken at random positions between 5% and 95% of duration. Scaling, `--force-anamorphic`, deinterlacing and `--force-scan` field order are applied exactly as for thumbnails made alongside `-h264`.
+- Thumbnails use the same names as the H.264 run, so `_thumb_1` … `_thumb_N` **overwrite** any existing thumbnails with those numbers. Existing higher-numbered thumbnails (e.g. `_thumb_5` onward when N is 4) are left alone.
+- Source files are **left in place**. They're never moved to `finished_sources`, and no `finished_sources` folder is created inside the source directory, so you can point `--source-dir` straight at an existing `finished_sources` folder.
+- Nothing is recorded in `transcode_summary.csv`, and files already marked complete there are **not** skipped.
+- The run is **appended** to the file's existing process log under a `THUMBNAIL-ONLY RUN` header, so the original transcode's commands and validation results are preserved.
+- `--thumbs` must be at least 1 in this mode.
 
 If H.264 encoding fails, all thumbnails for that file are deleted as part of cleanup.
 
@@ -496,6 +564,34 @@ If `mediaconch` is not found, the check is skipped with a startup warning and tr
 ### Command logging
 
 Every ffmpeg and MediaConch command run for a file — encode passes, framemd5/streamhash hashing, policy checks — is logged verbatim to that file's process log, for troubleshooting.
+
+### MediaInfo summary
+
+For each file, right after the `Source:` line, `vdg` prints a condensed MediaInfo summary to the terminal and to both the session log and the per-file process log:
+
+```
+INFO: MediaInfo — ab123cd4567_pm.mkv
+Container            : Matroska
+File size            : 4.70 MiB
+Format               : FFV1
+Codec ID             : V_MS/VFW/FOURCC / FFV1
+Duration             : 6 s 6 ms
+Bit rate             : 5 375 kb/s
+Width                : 720 pixels
+Height               : 486 pixels
+Display aspect ratio : 3:2
+Frame rate mode      : Constant
+Frame rate           : 29.970 (30000/1001) FPS
+Standard             : NTSC
+Color space          : YUV
+Chroma subsampling   : 4:2:0
+Bit depth            : 8 bits
+Scan type            : Interlaced
+Scan order           : Bottom Field First
+Audio                : PCM, 1 channel, 44.1 kHz, 24 bits
+```
+
+Values are MediaInfo's own, taken from the first video track, with one line per audio track. Fields the source doesn't report are omitted. MediaInfo's scan type and scan order are independent of ffprobe's field-order detection, which makes the summary a quick cross-check for interlacing problems. If `mediainfo` fails on a particular file, a warning is logged and processing continues.
 
 ### Log files
 
@@ -597,6 +693,13 @@ vdg --source-dir /Volumes/disk/1/source --output-dir /Volumes/disk/1/output \
     --keep-failed --keep-framemd5 -ffv1
 ```
 
+### Regenerate thumbnails only (no video derivative)
+
+```bash
+vdg --source-dir /Volumes/disk/1/source/finished_sources --output-dir /Volumes/disk/1/output \
+    --thumbs 30
+```
+
 ### Custom thumbnail count
 
 ```bash
@@ -633,9 +736,15 @@ vdg --source-dir /Volumes/disk/1/source --output-dir /Volumes/disk/1/output \
 
 v210 output is restricted to SD sources that resolve to NTSC (720×480/486, 29.97 fps) or PAL (720×576, 25 fps). HD sources, non-standard frame rates, or non-standard dimensions will not qualify. If the source is a valid SD tape output but the error still occurs, check whether ffprobe is misreading the frame rate — use `--force-fps` to correct it. If you need a lossless derivative from an HD or non-standard source, use `-ffv1` instead — it has no video-standard restriction.
 
+### "Source directory does not exist" / "Output directory does not exist, and neither does its parent folder"
+
+`vdg` checks both directories before creating anything, and exits with a plain error message and exit code 2 rather than a traceback. The message names the path that's missing and either the drive that isn't mounted (for `/Volumes/...` paths) or the deepest part of the path that does exist. Check the `--source-dir`/`--output-dir` values, including default paths set in a shell alias (`~/.zshrc`/`~/.bashrc`) or in the installed `cli.py`.
+
+A missing output folder is created automatically only when its parent folder exists, and a warning is logged when that happens. If the parent is missing too, `vdg` stops instead. That guards against a typo or an unmounted external drive silently creating a new directory tree somewhere unexpected, such as under `/Volumes` on the boot disk.
+
 ### "At least one output format must be specified"
 
-One of `-h264`, `-v210`, `-prores`, or `-ffv1` must be included in every invocation.
+One of `-h264`, `-v210`, `-prores`, or `-ffv1` must be included in every invocation, unless `--thumbs N` is passed on its own to [generate thumbnails only](#thumbnails-only).
 
 ### A source file ended up in QUARANTINE
 
@@ -643,7 +752,7 @@ Check the per-file process log in `process_logs/` for the reason. The three caus
 
 ### DV source processes but frame rate / GOP is wrong
 
-dvrescue-packaged DV-in-MKV files can report incorrect frame rates in container metadata. Always use `--force-fps 29.97` for standard NTSC DV sources from this workflow. If you see very large GOP values or unusually fast/slow progress bars, this is the likely cause.
+dvrescue-packaged DV-in-MKV and raw `.dv` files can report incorrect frame rates in container metadata. `vdg` now corrects DV sources automatically from the DV frame header and logs a `DV frame rate misreported by container` warning when it does (see [DV frame rate correction](#dv-frame-rate-correction)). If the rate is still wrong, or the source isn't DV, pass `--force-fps 29.97` (or `25`). Very large GOP values or oddly fast/slow progress bars are the usual sign.
 
 ### Audio sounds wrong — only one channel has content
 
@@ -655,11 +764,22 @@ The skip logic requires both a `Success` entry in the CSV *and* all output files
 
 ### v210 or FFV1 lossless validation fails
 
+**v210 only — reserved code values:** FFmpeg's v210 encoder clips 10-bit samples to 4–1019, because 0–3 and 1020–1023 are reserved for sync in SDI. A source containing those values can't round-trip through v210, so framemd5 fails even though the transcode is otherwise correct. SDI captures (e.g. vrecord) can't contain them; software-decoded sources such as Domesday Duplicator/ld-decode output can.
+
+
 Check the process log for the specific frame numbers where the mismatch occurred, and for the MediaConch output if the framemd5 comparison passed but validation still failed. Common causes: source file corruption, interrupted encoding run, disk I/O errors during encoding, or (for MediaConch) a genuinely non-conformant source. Re-run the job; if validation fails consistently on the same file, use `--keep-failed` to retain the output for manual inspection rather than having it deleted each time.
+
+### Lossless validation fails on files that used to pass, or ffprobe errors on every file
+
+Check the FFmpeg version first: `which ffmpeg && ffmpeg -version | head -1`. If it reports 8.x or 9.x, a `brew upgrade` or a third-party PPA has replaced the pinned build. Reinstall per [Supported FFmpeg versions](#supported-ffmpeg-versions) — on macOS, confirm `/opt/homebrew/opt/ffmpeg@7/bin` is at the front of `PATH` in a new terminal.
 
 ### "mediaconch not found in PATH — policy conformance checks will be skipped"
 
 MediaConch is optional; without it, `vdg` still runs framemd5/streamhash validation for `-v210`/`-ffv1` but skips the policy conformance step. See [INSTALL_MACOS.md](INSTALL_MACOS.md) or [INSTALL_UBUNTU.md](INSTALL_UBUNTU.md) for install instructions if you want policy checks enabled.
+
+### MediaConch policy check fails on a v210 NTSC source with "Video frame rate is 29.970"
+
+The source is probably true 30.000 fps. `vdg` treats 720×480/486 sources within 0.1 fps of 29.97 as NTSC, so 30.0 is accepted, because ffprobe can misreport genuine 29.97 material as 30.0. The v210 encode keeps the source frame rate, so a true 30p file fails the policy's 29.970 fps rule and is quarantined. This is intended: 30p SD doesn't come off tape. It usually means a born-digital or acquired file that needs a closer look before it becomes a v210 master. Check the file's `Frame rate` in the MediaInfo summary.
 
 ### MediaConch policy check fails on a v210 PAL source
 
@@ -680,6 +800,14 @@ This should no longer happen automatically — `vdg` disambiguates output filena
 ### Output from a DVD-sourced MPEG-2 file is 352×480 instead of 640×480
 
 The source is likely half-D1 NTSC (352×480), a reduced horizontal resolution format used by direct-to-disc DVD recorders. These files use non-square pixels (SAR 20:11) with a 4:3 DAR, which should display at 640×480. The script handles this case explicitly and will scale to 640×480 to match standard NTSC derivative output (H.264 only — `-prores`/`-ffv1` preserve native dimensions regardless). If the output is coming out at the wrong resolution, confirm the DAR reported by ffprobe is `4:3` — if the container metadata is incorrect, the passthrough branch may have been triggered instead.
+
+### Source has no audio track
+
+Sources with no audio track are supported for every format. `-ffv1`, `-v210` and `-prores` produce video-only output, and lossless validation compares video frames only, logging `Audio result: N/A — no audio stream in source`. Before v1.5, these formats failed on any source without audio.
+
+### H.264 audio drops out partway through (video keeps playing)
+
+This was issue #10, fixed in v1.5 by encoding video and muxing audio in separate ffmpeg processes (see [H.264 MP4](#h264-mp4--h264)). If it happens on v1.5 or later, send the process log: it contains the pass-2 and audio-mux commands verbatim. Also check whether the source itself has the gap, using MediaInfo or by listening to the source around the same timestamp.
 
 ### Output file has no audio
 

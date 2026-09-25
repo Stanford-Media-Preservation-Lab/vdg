@@ -55,6 +55,8 @@ See [MANUAL.md](MANUAL.md) for the full command reference, flag descriptions, sc
 
 - Python 3.10+
 - `ffmpeg` and `ffprobe` in `PATH` (must be compiled with `libx264`, `libopenjpeg`, `prores_ks`, and FFV1 support)
+  - **macOS:** Homebrew `ffmpeg@7`, pinned. **Ubuntu 24.04:** stock `ffmpeg` 6.1.x, held. FFmpeg 9.x is **not supported** — it breaks ffprobe parsing and lossless FFV1/v210 validation. See the install guides.
+- `mediainfo` (MediaInfo CLI) in `PATH` — per-file technical metadata summary
 - `tqdm`
 - `mediaconch` in `PATH` *(optional)* — enables policy conformance checks on `-v210`/`-ffv1` output. If absent, `vdg` logs a warning at startup and skips the check without failing the run.
 
