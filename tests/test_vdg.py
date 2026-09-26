@@ -19,6 +19,26 @@ from vdg.cli import (
     clean_aperture_input_args,
     collect_video_files,
     handle_failed_lossless_output,
+    parse_ffmpeg_version,
+    validate_directories,
+    describe_missing_path,
+    ConfigError,
+    parse_mediainfo_text,
+    format_mediainfo_summary,
+    classify_frame_field_order,
+    field_order_read_intervals,
+    scan_type_disagreement,
+    prores_interlace_args,
+    VideoInfo,
+    parse_dv_system,
+    dv_nominal_fps,
+    add_audio_async_filter,
+    AUDIO_ASYNC_FILTER,
+    policy_without_audio_rules,
+    policy_without_dimension_rules,
+    POLICY_FFV1,
+    POLICY_V210_NTSC,
+    POLICY_V210_PAL,
     VideoStandard,
     ROLE_CODES,
 )
@@ -143,8 +163,15 @@ class TestDetectVideoStandard:
         assert detect_video_standard(1920, 1080, 29.97) == VideoStandard.UNKNOWN
 
     def test_ntsc_fps_tolerance(self):
-        # ffprobe sometimes reports 30.0 for 29.97 — should NOT match NTSC
-        assert detect_video_standard(720, 480, 30.0) == VideoStandard.UNKNOWN
+        # 30.0 is within the 0.1 tolerance and is deliberately treated as NTSC:
+        # ffprobe can misreport a true 29.97 SD source as 30.0, and v210 output
+        # should still be possible. Genuine 30p SD doesn't come off tape — it only
+        # appears in born-digital/acquired media, where the v210 MediaConch policy
+        # (29.970fps) then fails and flags the file for review.
+        assert detect_video_standard(720, 480, 30.0) == VideoStandard.NTSC
+
+    def test_ntsc_outside_tolerance(self):
+        assert detect_video_standard(720, 480, 25.0) == VideoStandard.UNKNOWN
 
     def test_pal_fps_tolerance(self):
         assert detect_video_standard(720, 576, 25.0) == VideoStandard.PAL
@@ -331,3 +358,278 @@ class TestHandleFailedLosslessOutput:
         # Should not raise even though the file was never created.
         handle_failed_lossless_output(output_path, keep_failed=True)
         handle_failed_lossless_output(output_path, keep_failed=False)
+
+
+# ---------------------------------------------------------------------------
+# parse_ffmpeg_version
+# ---------------------------------------------------------------------------
+
+class TestParseFfmpegVersion:
+    def test_homebrew_release(self):
+        out = "ffmpeg version 7.1.5 Copyright (c) 2000-2025 the FFmpeg developers\nbuilt with Apple clang"
+        assert parse_ffmpeg_version(out) == ("7.1.5", 7)
+
+    def test_ubuntu_package(self):
+        out = "ffprobe version 6.1.1-3ubuntu5 Copyright (c) 2007-2023 the FFmpeg developers"
+        assert parse_ffmpeg_version(out) == ("6.1.1-3ubuntu5", 6)
+
+    def test_newer_major(self):
+        assert parse_ffmpeg_version("ffmpeg version 9.0.2 Copyright")[1] == 9
+
+    def test_n_prefixed_tag(self):
+        assert parse_ffmpeg_version("ffmpeg version n7.1 Copyright") == ("n7.1", 7)
+
+    def test_git_snapshot_has_no_major(self):
+        assert parse_ffmpeg_version("ffmpeg version N-118000-gabc1234 Copyright") == ("N-118000-gabc1234", None)
+
+    def test_unrecognized_output(self):
+        assert parse_ffmpeg_version("") == (None, None)
+        assert parse_ffmpeg_version("command not found") == (None, None)
+
+
+# ---------------------------------------------------------------------------
+# validate_directories / describe_missing_path
+# ---------------------------------------------------------------------------
+
+class TestValidateDirectories:
+    def test_existing_dirs_ok(self, tmp_path):
+        (tmp_path / "src").mkdir(); (tmp_path / "out").mkdir()
+        assert validate_directories(tmp_path / "src", tmp_path / "out") == []
+
+    def test_missing_source_raises(self, tmp_path):
+        with pytest.raises(ConfigError, match="Source directory does not exist"):
+            validate_directories(tmp_path / "nope" / "src", tmp_path)
+
+    def test_source_is_file_raises(self, tmp_path):
+        f = tmp_path / "file.mov"; f.write_text("x")
+        with pytest.raises(ConfigError, match="not a directory"):
+            validate_directories(f, tmp_path)
+
+    def test_missing_output_leaf_is_created_with_notice(self, tmp_path):
+        (tmp_path / "src").mkdir()
+        notices = validate_directories(tmp_path / "src", tmp_path / "out")
+        assert len(notices) == 1 and "creating it" in notices[0]
+
+    def test_missing_output_parent_raises(self, tmp_path):
+        (tmp_path / "src").mkdir()
+        with pytest.raises(ConfigError, match="neither does its parent"):
+            validate_directories(tmp_path / "src", tmp_path / "missing" / "out")
+
+    def test_error_names_deepest_existing_folder(self, tmp_path):
+        with pytest.raises(ConfigError, match=str(tmp_path)):
+            validate_directories(tmp_path / "a" / "b", tmp_path)
+
+class TestDescribeMissingPath:
+    def test_unmounted_volume(self):
+        msg = describe_missing_path(Path("/Volumes/NoSuchDrive_vdg_test/1/source"))
+        assert "NoSuchDrive_vdg_test" in msg and "not mounted" in msg
+
+
+# ---------------------------------------------------------------------------
+# MediaInfo summary
+# ---------------------------------------------------------------------------
+
+MEDIAINFO_SAMPLE = """General
+Complete name                            : src.mov
+Format                                   : MPEG-4
+Format profile                           : QuickTime
+File size                                : 38.7 MiB
+Duration                                 : 1 h 14 min
+Overall bit rate                         : 81.2 Mb/s
+
+Video
+ID                                       : 1
+Format                                   : AVC
+Format profile                           : High@L5.1
+Format settings                          : CABAC / 1 Ref Frames
+Codec ID                                 : avc1
+Bit rate                                 : 18.8 Mb/s
+Width                                    : 3 840 pixels
+Height                                   : 2 160 pixels
+Display aspect ratio                     : 16:9
+Frame rate mode                          : Constant
+Frame rate                               : 30.000 FPS
+Color space                              : YUV
+Chroma subsampling                       : 4:2:0
+Bit depth                                : 8 bits
+Scan type                                : Progressive
+
+Audio #1
+Format                                   : PCM
+Format settings                          : Little / Signed
+Channel(s)                               : 2 channels
+Sampling rate                            : 48.0 kHz
+Bit depth                                : 24 bits
+
+Audio #2
+Format                                   : AAC LC
+Channel(s)                               : 1 channel
+Sampling rate                            : 48.0 kHz
+"""
+
+class TestMediainfoSummary:
+    def test_parse_sections(self):
+        sections = parse_mediainfo_text(MEDIAINFO_SAMPLE)
+        assert [name for name, _ in sections] == ["General", "Video", "Audio #1", "Audio #2"]
+        assert sections[1][1]["Format profile"] == "High@L5.1"
+
+    def test_summary_fields(self):
+        lines = format_mediainfo_summary(MEDIAINFO_SAMPLE)
+        text = "\n".join(lines)
+        assert lines[0].startswith("Container") and lines[0].endswith(": MPEG-4 / QuickTime")
+        for expected in ["AVC", "High@L5.1", "CABAC / 1 Ref Frames", "avc1", "1 h 14 min", "18.8 Mb/s",
+                         "3 840 pixels", "16:9", "Constant", "30.000 FPS", "4:2:0", "8 bits", "Progressive"]:
+            assert expected in text
+        assert lines[-2].endswith(": PCM, 2 channels, 48.0 kHz, 24 bits")
+        assert lines[-1].endswith(": AAC LC, 1 channel, 48.0 kHz")
+
+    def test_duration_from_general_when_video_lacks_it(self):
+        assert any(l.startswith("Duration") and l.endswith("1 h 14 min")
+                   for l in format_mediainfo_summary(MEDIAINFO_SAMPLE))
+
+    def test_no_audio(self):
+        lines = format_mediainfo_summary("General\nFormat : Matroska\n\nVideo\nFormat : FFV1\n")
+        assert lines[-1].startswith("Audio") and lines[-1].endswith(": none")
+
+
+# ---------------------------------------------------------------------------
+# classify_frame_field_order (issue #9 — first-frame field order fallback)
+# ---------------------------------------------------------------------------
+
+class TestClassifyFrameFieldOrder:
+    def _frames(self, *pairs):
+        return [{"interlaced_frame": i, "top_field_first": t} for i, t in pairs]
+
+    def test_bff_dv(self):
+        assert classify_frame_field_order(self._frames(*[(1, 0)] * 5)) == "bff"
+
+    def test_tff(self):
+        assert classify_frame_field_order(self._frames(*[(1, 1)] * 5)) == "tff"
+
+    def test_progressive(self):
+        assert classify_frame_field_order(self._frames(*[(0, 0)] * 5)) == "progressive"
+
+    def test_majority_vote(self):
+        assert classify_frame_field_order(self._frames((1, 0), (1, 0), (1, 0), (0, 0), (0, 0))) == "bff"
+
+    def test_no_frames(self):
+        assert classify_frame_field_order([]) is None
+
+
+# ---------------------------------------------------------------------------
+# DV system / frame rate (misreported container rates on raw & dvrescue DV)
+# ---------------------------------------------------------------------------
+
+class TestDvSystem:
+    def test_ntsc_header(self):
+        assert parse_dv_system(bytes([0x1f, 0x07, 0x00, 0x3f, 0xf9])) == "525/60"
+
+    def test_pal_header(self):
+        assert parse_dv_system(bytes([0x1f, 0x07, 0x00, 0xbf, 0xf8])) == "625/50"
+
+    def test_not_a_header_block(self):
+        assert parse_dv_system(bytes([0x3f, 0x07, 0x00, 0x3f])) is None
+
+    def test_too_short(self):
+        assert parse_dv_system(b"") is None
+
+    def test_nominal_rates(self):
+        assert dv_nominal_fps("525/60", 480) == pytest.approx(29.97, abs=0.001)
+        assert dv_nominal_fps("625/50", 576) == 25.0
+        assert dv_nominal_fps("525/60", 1080) == pytest.approx(29.97, abs=0.001)
+        assert dv_nominal_fps("525/60", 720) == pytest.approx(59.94, abs=0.001)
+        assert dv_nominal_fps("625/50", 720) == 50.0
+
+
+# ---------------------------------------------------------------------------
+# add_audio_async_filter (issue #10 — separate H.264 audio mux)
+# ---------------------------------------------------------------------------
+
+class TestAddAudioAsyncFilter:
+    def test_no_existing_filter(self):
+        assert add_audio_async_filter([]) == ["-af", AUDIO_ASYNC_FILTER]
+
+    def test_prepended_to_af_chain(self):
+        assert add_audio_async_filter(["-af", "pan=stereo|c0=c0|c1=c0"]) == \
+            ["-af", f"{AUDIO_ASYNC_FILTER},pan=stereo|c0=c0|c1=c0"]
+
+    def test_appended_inside_filter_complex(self):
+        out = add_audio_async_filter(["-filter_complex", "[0:a:0][0:a:1]amerge=inputs=2[aout]", "-map", "[aout]"])
+        assert out == ["-filter_complex", f"[0:a:0][0:a:1]amerge=inputs=2,{AUDIO_ASYNC_FILTER}[aout]", "-map", "[aout]"]
+
+
+# ---------------------------------------------------------------------------
+# policy_without_audio_rules (MediaConch on sources with no audio track)
+# ---------------------------------------------------------------------------
+
+import xml.etree.ElementTree as ET
+
+class TestPolicyWithoutAudioRules:
+    @pytest.mark.parametrize("policy", [POLICY_FFV1, POLICY_V210_NTSC, POLICY_V210_PAL])
+    def test_no_audio_rules_and_still_valid_xml(self, policy):
+        stripped = policy_without_audio_rules(policy)
+        root = ET.fromstring(stripped.encode())
+        assert not [r for r in root.iter("rule") if r.get("tracktype") == "Audio"]
+        video_rules = [r for r in ET.fromstring(policy.encode()).iter("rule") if r.get("tracktype") != "Audio"]
+        assert len([r for r in root.iter("rule")]) == len(video_rules)
+
+    def test_ffv1_empty_audio_subpolicy_removed(self):
+        root = ET.fromstring(policy_without_audio_rules(POLICY_FFV1).encode())
+        assert not [p for p in root.iter("policy") if len(list(p)) == 0]
+        assert "Audio is PCM or FLAC" not in policy_without_audio_rules(POLICY_FFV1)
+
+    def test_dimension_rules_removed_others_kept(self):
+        stripped = policy_without_dimension_rules(POLICY_V210_NTSC)
+        rules = list(ET.fromstring(stripped.encode()).iter("rule"))
+        assert not [r for r in rules if r.get("value") in ("Width", "Height")]
+        original = list(ET.fromstring(POLICY_V210_NTSC.encode()).iter("rule"))
+        assert len(rules) == len(original) - 2
+
+
+class TestFieldOrderSampling:
+    def test_intervals_spread_across_file(self):
+        spec = field_order_read_intervals(3600.0)
+        assert spec == "360.000%+#5,1080.000%+#5,1800.000%+#5,2520.000%+#5,3240.000%+#5"
+
+    def test_unknown_duration_reads_from_start(self):
+        assert field_order_read_intervals(0) == "%+#5"
+
+    def test_damaged_head_outvoted(self):
+        head = [{"interlaced_frame": 0, "top_field_first": 0}] * 5
+        body = [{"interlaced_frame": 1, "top_field_first": 0}] * 20
+        assert classify_frame_field_order(head + body) == "bff"
+
+
+class TestScanTypeDisagreement:
+    LINES = ["Width                : 720 pixels", "Scan type            : Interlaced"]
+
+    def test_flags_interlaced_treated_as_progressive(self):
+        assert scan_type_disagreement(self.LINES, interlaced=False) == "Interlaced"
+
+    def test_agreement_is_none(self):
+        assert scan_type_disagreement(self.LINES, interlaced=True) is None
+
+    def test_mbaff_ignored(self):
+        assert scan_type_disagreement(["Scan type            : MBAFF"], interlaced=False) is None
+
+    def test_missing_scan_type(self):
+        assert scan_type_disagreement(["Width : 720 pixels"], interlaced=False) is None
+
+
+class TestProresInterlaceArgs:
+    def _info(self, interlaced, source="stream", detail="tt"):
+        return VideoInfo(width=720, height=486, duration=10, fps=29.97, dar="4:3", has_audio=True,
+                         total_frames=300, codec="ffv1", interlaced=interlaced, is_vfr=False,
+                         is_quicktime=False, field_order_source=source, field_order_detail=detail)
+
+    def test_progressive_untouched(self):
+        assert prores_interlace_args(self._info(False)) == []
+
+    def test_stream_field_order_relies_on_frame_flags(self):
+        assert prores_interlace_args(self._info(True)) == ["-flags", "+ildct"]
+
+    def test_frame_sampled_order_pinned(self):
+        assert prores_interlace_args(self._info(True, "frames", "bff")) == ["-flags", "+ildct", "-vf", "setfield=bff"]
+
+    def test_force_scan_wins(self):
+        assert prores_interlace_args(self._info(True, "frames", "bff"), "tff") == ["-flags", "+ildct", "-vf", "setfield=tff"]
