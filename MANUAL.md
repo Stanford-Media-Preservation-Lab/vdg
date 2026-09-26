@@ -1,7 +1,7 @@
 # Video Derivative Generator (vdg)
-## User Manual — v1.4.2
+## User Manual — v1.5.0
 **Stanford Media Preservation Lab**
-*July 2026*
+*September 2026*
 
 ---
 
@@ -53,6 +53,18 @@ Four output formats are available: `-h264`, `-v210`, `-prores`, `-ffv1`. At leas
 | `mediaconch` | *(Optional)* Policy conformance checks on `-v210`/`-ffv1` output |
 
 `ffmpeg`, `ffprobe` and `mediainfo` must be present in `PATH`. The script checks for them at startup and exits if any is missing. `mediaconch` is checked separately — if it's missing, `vdg` logs a warning and skips policy conformance checks for the run rather than exiting.
+
+At startup, `vdg` lists every dependency with its version and location, in the terminal and the session log, so each run's log records exactly which toolchain produced it:
+
+```
+INFO: Dependencies:
+  ffmpeg      7.1.5  /opt/homebrew/bin/ffmpeg
+  ffprobe     7.1.5  /opt/homebrew/bin/ffprobe
+  mediainfo   26.05  /opt/homebrew/bin/mediainfo
+  mediaconch  25.04  /opt/homebrew/bin/mediaconch
+  Python      3.13.7 /opt/homebrew/opt/python@3.13/bin/python3.13
+  tqdm        4.67.1
+```
 
 ### Supported FFmpeg versions
 
@@ -112,22 +124,26 @@ Audio: AAC stereo, 48 kHz, 128 kbps. See [Audio Configuration](#audio-configurat
 
 1. **Pass 1**: x264 analysis pass, video only.
 2. **Pass 2**: x264 final encode, video only, written to `process_logs/<base>_sl_video_tmp.mp4`.
-3. **Audio mux**: the pass-2 video is stream-copied (not re-encoded) into the final MP4, and the audio is decoded, filtered and AAC-encoded from the source. `aresample=async=1:min_hard_comp=0.1:first_pts=0` is applied ahead of any `--audio-mode`/`--clip-ceiling` filters, and `-max_interleave_delta 0` is passed to the muxer.
+3. **Audio mux**: the pass-2 video is stream-copied (not re-encoded) into the final MP4, and the audio is decoded, filtered and AAC-encoded from the source.
 
-This split fixes audio dropping out partway through long files, observed around 35 minutes into long Premiere ProRes HQ exports ([issue #10](https://github.com/Stanford-Media-Preservation-Lab/vdg/issues/10)). When slow x264 video and near-instant AAC audio were encoded in one process, the audio went silent while the video kept playing and the file duration still looked correct. The temp video is deleted after a successful mux. If pass 2 or the mux fails, it's left in `process_logs/` for inspection. Sources with no audio skip the mux step: pass 2 writes the final file directly.
+Keeping video encoding and audio encoding in separate ffmpeg processes is the fix for audio dropping out partway through long files, observed around 35 minutes into long Premiere ProRes HQ exports ([issue #10](https://github.com/Stanford-Media-Preservation-Lab/vdg/issues/10)). When slow x264 video and near-instant AAC audio were encoded in one process, the audio went silent while the video kept playing and the file duration still looked correct. The mux step also passes `aresample=async=1:min_hard_comp=0.1:first_pts=0` (ahead of any `--audio-mode`/`--clip-ceiling` filters) and `-max_interleave_delta 0`. Neither fixed the dropout on its own. They're kept because they're part of the command confirmed on a real 1:47:12 Premiere export. The split applies to every `-h264` source with audio: the mux step only reads the file and decodes audio, so it adds little time. The temp video is deleted after a successful mux. If pass 2 or the mux fails, it's left in `process_logs/` for inspection. Sources with no audio skip the mux step: pass 2 writes the final file directly.
 
 Output filename: `<base>_sl.mp4`
 
 ### v210 QuickTime (`-v210`)
 
-Uncompressed 10-bit 4:2:2 in a QuickTime container. **SD sources only** (see [Intake Pipelines](#intake-pipelines)). A framemd5 lossless validation is performed after encoding, comparing the video stream of the output against the source frame by frame, and comparing audio stream hashes — see [Validation and Logging](#validation-and-logging). If `mediaconch` is available, a policy conformance check also runs, currently defined for NTSC sources only. The output file is deleted (or retained with a `_VALIDATION_FAILED` suffix, with `--keep-failed`) if any of these checks fail, and the source is quarantined — see [Quarantine Workflow](#quarantine-workflow).
+Uncompressed 10-bit 4:2:2 in a QuickTime container. **SD sources only** (see [Intake Pipelines](#intake-pipelines)). A framemd5 lossless validation is performed after encoding, comparing the video stream of the output against the source frame by frame, and comparing audio stream hashes — see [Validation and Logging](#validation-and-logging). If `mediaconch` is available, a policy conformance check also runs, with separate policies for NTSC and PAL. The output file is deleted (or retained with a `_VALIDATION_FAILED` suffix, with `--keep-failed`) if any of these checks fail, and the source is quarantined — see [Quarantine Workflow](#quarantine-workflow).
 
 Color metadata is set per standard:
 
-| Standard | Field order | SAR |
-|----------|-------------|-----|
-| NTSC | BFF | 10:11 |
-| PAL | TFF | 12/11 |
+| Standard | Field order | SAR | Primaries / matrix | Transfer |
+|----------|-------------|-----|--------------------|----------|
+| NTSC | BFF | 10:11 | `smpte170m` (BT.601 NTSC / BT.601) | BT.709 |
+| PAL | TFF | 12/11 | `bt470bg` (BT.601 PAL / BT.470 System B/G) | BT.709 |
+
+These match the tags vrecord writes on its NTSC and PAL captures. Before v1.5.0, PAL v210 output was tagged with NTSC primaries. The field order is fixed per standard, which is correct for SDI captures. PAL DV (bottom field first) and TFF NTSC sources would be mislabelled, but neither is sent to v210 in this lab's workflow (see the note on RF captures below).
+
+**Not for RF captures (lab rule):** don't transcode Domesday Duplicator / ld-decode (RF-decoded) captures to v210. FFmpeg's v210 encoder can only store 10-bit values 4–1019, because 0–3 and 1020–1023 are reserved for SDI sync. RF-decoded footage routinely contains those codes (a DdD test clip had luma 0–1023 in every frame), so framemd5 validation can never pass, and the v210 would be no more faithful than ProRes. RF captures are also often TFF NTSC with 44.1 kHz audio, which the NTSC policy rejects. Use `-prores` for mezzanine/editing copies of RF captures. The FFV1 capture remains the preservation master and is the only copy that keeps the full 0–1023 range.
 
 Audio: PCM 24-bit little-endian (`pcm_s24le`).
 
@@ -136,6 +152,10 @@ Output filename: `<stem>.mov` (no role code change)
 ### ProRes 422 HQ QuickTime (`-prores`)
 
 Apple ProRes 422 HQ using the `prores_ks` encoder, profile 3, video tag `apch` (the ProRes 422 HQ fourCC), vendor tag `apl0`. No scaling filter is applied — output dimensions match the source exactly. Audio is copied from the source stream without re-encoding. No lossless validation or MediaConch check is performed for ProRes output.
+
+**Interlaced sources** are encoded as interlaced ProRes (`-flags +ildct`), so each frame is compressed and flagged as two fields in the ProRes bitstream itself, not just labelled TFF/BFF in the container. When the field order comes from `--force-scan` or from the frame-sampling fallback (see [`--force-scan`](#--force-scan)), it's also pinned with `setfield`, so every frame carries it, including frames from a damaged tape head that have no field flags of their own. Progressive sources are encoded progressive, as before.
+
+**Value range:** ProRes stores 10-bit samples in the 4–1019 range, like v210. Codes 0–3 and 1020–1023, which can occur in RF-decoded (Domesday Duplicator/ld-decode) material, are clipped. Those values are far outside the black-to-white picture range, so the clip isn't visible, and ProRes is not validated as lossless.
 
 Output filename: `<base>_sh.mov`
 
@@ -174,7 +194,7 @@ An earlier iteration of this logic used `-flags2 +ignorecrop`, which turned out 
 
 ### `--clean-aperture`: honor the crop instead
 
-Pass `--clean-aperture` to do the opposite: omit `-apply_cropping 0` and let ffmpeg apply its native clap crop, producing display-cropped output at non-standard dimensions. For example, a 720×486 source with an 8/8/3/3 crop becomes 704×480. Only use this if you specifically want the display-cropped result rather than the full preservation frame — it is not the recommended setting for archival masters.
+Pass `--clean-aperture` to do the opposite: omit `-apply_cropping 0` and let ffmpeg apply its native clap crop, producing display-cropped output at non-standard dimensions. For example, a 720×486 source with an 8/8/3/3 crop becomes 704×480. Only use this if you specifically want the display-cropped result rather than the full preservation frame — it is not the recommended setting for archival masters. With `-v210`, the cropped output can't satisfy the NTSC policy's 720×486 rule, so `vdg` skips just the MediaConch width and height rules for that run. Every other rule still applies. It logs a yellow warning with the actual output size and notes the omission in the process log, so a cropped v210 is always flagged rather than quarantined.
 
 ### The dimension/crop warnings
 
@@ -463,10 +483,10 @@ Overrides field order detection. Choices: `progressive`, `tff`, `bff`.
 **How detection works without the override:**
 
 1. The stream-level `field_order` reported by ffprobe is used when present.
-2. If it's missing or `unknown`, `vdg` reads the `interlaced_frame`/`top_field_first` flags from the first 5 frames, decides by majority, and logs the result: `Source: 720x480 @ 29.97fps (interlaced, BFF — from first-frame metadata, no stream field order)`. This catches DV sources (raw `.dv` and dvrescue DV-in-MKV), where the field order exists only at the codec level. Before v1.5 those were silently treated as progressive, which left combing in the H.264 output.
+2. If it's missing or `unknown`, `vdg` reads the `interlaced_frame`/`top_field_first` flags from 5 frames at each of 10%, 30%, 50%, 70% and 90% of the duration, decides by majority, and logs the result: `Source: 720x480 @ 29.97fps (interlaced, BFF — from frame metadata sampled across the file, no stream field order)`. Sampling across the file matters. On a real dvrescue capture, the first 30+ seconds (blank or damaged tape at the head) decoded as progressive while the rest of the tape was BFF. This catches DV sources (raw `.dv` and dvrescue DV-in-MKV), where the field order exists only at the codec level. Before v1.5 those were silently treated as progressive, which left combing in the H.264 output.
 3. If neither source has field order metadata, the file is treated as progressive and a warning suggests `--force-scan`.
 
-The scan type and its source are also written to the per-file process log (`Scan:` line). The MediaInfo summary's `Scan type`/`Scan order` gives an independent cross-check.
+The scan type and its source are also written to the per-file process log (`Scan:` line). If MediaInfo's `Scan type` (Interlaced vs Progressive) contradicts vdg's decision, a yellow `scan type disagreement` warning suggests checking the output or rerunning with `--force-scan`. The check is skipped when `--force-scan` is passed.
 
 | Value | Effect |
 |-------|--------|
@@ -557,7 +577,10 @@ If `mediaconch` is installed and in `PATH`, `vdg` runs an embedded policy check 
 | Format | Policy file | Scope | Checks |
 |--------|-------------|-------|--------|
 | FFV1 | `policy_ffv1.xml` | All video standards | Matroska container, FFV1 codec, GOP N=1 (intra), per-slice and container-level CRC error detection, audio is PCM or FLAC |
-| v210 | `policy_v210_ntsc.xml` | **NTSC only** — no PAL policy is currently defined | MPEG-4/QuickTime container, v210 codec, 720×486 @ 29.970fps, 4:2:2, 10-bit, interlaced BFF, BT.601 NTSC color, PCM 24-bit 48kHz audio |
+| v210 | `policy_v210_ntsc.xml` | NTSC | MPEG-4/QuickTime container, v210 codec, 720×486 @ 29.970fps, 4:2:2, 10-bit, interlaced BFF, BT.601 NTSC primaries, BT.709 transfer, BT.601 matrix, PCM 24-bit 48kHz audio |
+| v210 | `policy_v210_pal.xml` | PAL | MPEG-4/QuickTime container, v210 codec, 720×576 @ 25.000fps, 4:2:2, 10-bit, interlaced TFF, BT.601 PAL primaries, BT.709 transfer, BT.470 System B/G matrix, PCM 24-bit 48kHz audio |
+
+For sources with no audio track, the audio rules are omitted. With `--clean-aperture`, the width and height rules are omitted.
 
 If `mediaconch` is not found, the check is skipped with a startup warning and treated as passing — it does not block otherwise-successful output. A policy failure after a passing framemd5 result still fails the job and quarantines the source. The policy XML is written to `process_logs/` for the duration of the check and deleted afterward unless `--keep-mediaconch` is passed.
 
@@ -783,7 +806,7 @@ The source is probably true 30.000 fps. `vdg` treats 720×480/486 sources within
 
 ### MediaConch policy check fails on a v210 PAL source
 
-There is currently no MediaConch policy defined for PAL v210 output — only NTSC. This is expected; the framemd5/streamhash lossless check still applies and is the authoritative pass/fail signal for PAL v210. A PAL source will not attempt a MediaConch check at all (logged as "skipped — no policy defined for this video standard"), so if you're seeing an actual MediaConch *failure* on a PAL source, double check `video_standard` detection in the process log — it may be misdetecting as NTSC.
+PAL v210 output is checked against `policy_v210_pal.xml` (added in v1.5.0). Look at which rules failed in the process log. `Scan order is TFF` failing means the source is bottom field first, most likely PAL DV, which shouldn't go to v210. A frame rate, size or standard failure usually means the source isn't really 625-line/25 fps; check the MediaInfo summary. Audio rules fail on 44.1 kHz or 16-bit audio, since vdg converts to 24-bit but keeps the source sample rate.
 
 ### Clean aperture crop warning appears, but I don't want it to change anything
 
@@ -821,6 +844,21 @@ The script checks for a minimum of 10 GB free in the output directory before pro
 
 ## Version History
 
+### v1.5.0 — September 2026
+- **H.264 audio dropout on long files fixed** ([#10](https://github.com/Stanford-Media-Preservation-Lab/vdg/issues/10)): video is encoded and audio muxed in separate ffmpeg processes. Verified on a 1:47:12 Premiere ProRes HQ export.
+- **FFmpeg pinned** ([#8](https://github.com/Stanford-Media-Preservation-Lab/vdg/issues/8)): `ffmpeg@7` on macOS, stock 6.1.x on Ubuntu, with a startup warning for untested versions and for ffmpeg/ffprobe mismatches. Startup now lists every dependency's version and path.
+- **MediaInfo summary per file** ([#5](https://github.com/Stanford-Media-Preservation-Lab/vdg/issues/5)). `mediainfo` is now a required dependency.
+- **Thumbnails-only mode** ([#3](https://github.com/Stanford-Media-Preservation-Lab/vdg/issues/3)): `--thumbs N` with no format flag.
+- **Clear errors for missing source/output directories** ([#4](https://github.com/Stanford-Media-Preservation-Lab/vdg/issues/4)), naming unmounted drives. A missing output folder is created only if its parent exists.
+- **DV field order** ([#9](https://github.com/Stanford-Media-Preservation-Lab/vdg/issues/9)): when the stream reports none, vdg falls back to frame metadata sampled across the file, so DV is no longer treated as progressive. A warning fires if MediaInfo's scan type disagrees.
+- **DV frame rate** is read from the DV frame header, correcting container-reported rates such as 60000 fps on raw `.dv`. Raw DV sent to `-ffv1` is no longer falsely quarantined as VFR.
+- **Sources with no audio track** now work with `-ffv1`, `-v210` and `-prores`. MediaConch audio rules are omitted for them.
+- **`--clean-aperture` with `-v210`** skips only the MediaConch width/height rules, with a warning showing the cropped size, instead of always being quarantined.
+- **Interlaced ProRes:** `-prores` output from interlaced sources is now encoded as interlaced (TFF/BFF) instead of progressive frames in an interlaced-labelled container.
+- **PAL v210:** a MediaConch policy for PAL (720×576, 25 fps, TFF), and PAL v210 output is now tagged with PAL primaries/matrix (`bt470bg`) instead of NTSC's.
+- **RF captures:** documented lab rule — no v210 for Domesday Duplicator/ld-decode captures; use `-prores` ([#6](https://github.com/Stanford-Media-Preservation-Lab/vdg/issues/6), [#7](https://github.com/Stanford-Media-Preservation-Lab/vdg/issues/7)).
+- Terminal output: log lines no longer collide with progress bars, the summary prints once, quarantined runs no longer report "SUCCESSFULLY", and there's no trailing whitespace when copying output.
+
 ### v1.4.2 — July 2026
 - FFV1 `VENDOR_ID` override is now gated on genuinely detected QuickTime sources (`major_brand` = `qt`) rather than being applied unconditionally.
 - Clean-aperture/dimension warnings are now logged once per file instead of twice (initial file-list scan and actual processing no longer both emit it).
@@ -847,4 +885,4 @@ The script checks for a minimum of 10 GB free in the output directory before pro
 
 ---
 
-*Stanford Media Preservation Lab — Video Derivative Generator v1.4.2 — July 2026*
+*Stanford Media Preservation Lab — Video Derivative Generator v1.5.0 — September 2026*

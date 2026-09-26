@@ -2,8 +2,8 @@
 vdg.cli — core logic for the Video Derivative Generator.
 
 Stanford Media Preservation Lab
-Video Derivative Generator - v1.4.2
-July 2026
+Video Derivative Generator - v1.5.0
+September 2026
 """
 
 import os
@@ -17,6 +17,7 @@ import shlex
 import re
 import random
 import argparse
+import platform
 import logging
 import threading
 import time
@@ -25,11 +26,12 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Set
 from dataclasses import dataclass
 from enum import Enum
+import tqdm as tqdm_module
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 SCRIPT_TITLE = "Stanford Media Preservation Lab"
-SCRIPT_NAME = "Video Derivative Generator, v1.4.2, July 2026"
+SCRIPT_NAME = "Video Derivative Generator, v1.5.0, September 2026"
 SCRIPT_SEPARATOR = "----"
 
 # Highest FFmpeg major version vdg has been validated against (lossless
@@ -62,6 +64,23 @@ class Colors:
     CYAN   = '\033[96m' if _COLOR else ''
     BOLD   = '\033[1m'  if _COLOR else ''
     RESET  = '\033[0m'  if _COLOR else ''
+
+ERASE_LINE = '\x1b[K'
+
+def console_write(text: str, file=None) -> None:
+    """Print a line (or block) above any active tqdm progress bars.
+    tqdm clears a bar by overwriting it with spaces; text printed over that
+    leaves those spaces behind as trailing whitespace, which shows up when
+    terminal output is copied. Prefixing each line with ERASE_LINE (only on a
+    real terminal) blanks the row first, so copied text comes out clean."""
+    file = file or sys.stdout
+    try:
+        is_tty = file.isatty()
+    except Exception:
+        is_tty = False
+    if is_tty:
+        text = "\n".join(ERASE_LINE + line for line in text.split("\n"))
+    tqdm.write(text, file=file)
 
 class ProcessStatus(Enum):
     SUCCESS = "Success"
@@ -120,7 +139,7 @@ Audio format is PCM or FLAC.</description>
 # Audio channel count and track count are intentionally unconstrained to accommodate
 # variable configurations (mono, stereo, multi-track). All audio tracks must be
 # PCM 24-bit 48kHz little-endian signed regardless of count.
-# NTSC only — PAL support to be added when required.
+# NTSC; see POLICY_V210_PAL for the PAL equivalent.
 POLICY_V210_NTSC = """\
 <?xml version="1.0"?>
 <policy type="and" name="VDG v210 MOV Master (NTSC SD)">
@@ -309,7 +328,23 @@ def setup_logging(log_dir: Path, dry_run: bool) -> logging.Logger:
             formatter = logging.Formatter(log_fmt)
             return formatter.format(record)
     
-    console_handler = logging.StreamHandler(sys.stdout)
+    class TqdmConsoleHandler(logging.StreamHandler):
+        """Writes console log messages via tqdm.write, which clears any active
+        progress bar, prints the message on its own line, then redraws the bar.
+        A plain StreamHandler appended messages to the bar's line — the first
+        character landed at the end of the bar and the rest wrapped."""
+        def emit(self, record):
+            try:
+                console_write(self.format(record), file=self.stream)
+                self.flush()
+            except Exception:
+                self.handleError(record)
+
+    console_handler = TqdmConsoleHandler(sys.stdout)
+    # Records logged with extra={'file_only': True} go to the session log only —
+    # used where the same content is already printed to the terminal in color
+    # (e.g. the processing summary), so it isn't shown twice.
+    console_handler.addFilter(lambda record: not getattr(record, 'file_only', False))
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(ColoredFormatter())
     logger.addHandler(console_handler)
@@ -366,9 +401,7 @@ def check_ffmpeg_version() -> None:
     logger = logging.getLogger('video_transcoder')
     ffmpeg_version, ffmpeg_major = get_tool_version('ffmpeg')
     ffprobe_version, ffprobe_major = get_tool_version('ffprobe')
-    logger.info(f"FFmpeg: {ffmpeg_version or 'unknown'} ({shutil.which('ffmpeg')})")
     if ffprobe_version != ffmpeg_version:
-        logger.info(f"ffprobe: {ffprobe_version or 'unknown'} ({shutil.which('ffprobe')})")
         logger.warning(f"ffmpeg ({ffmpeg_version or 'unknown'}) and ffprobe ({ffprobe_version or 'unknown'}) "
                        f"versions differ — check PATH so both come from the same FFmpeg install")
     checks = [('FFmpeg', ffmpeg_version, ffmpeg_major)]
@@ -382,6 +415,38 @@ def check_ffmpeg_version() -> None:
             logger.warning(f"{tool} {version} is newer than the tested FFmpeg {MAX_TESTED_FFMPEG_MAJOR}.x — "
                            f"ffprobe parsing and lossless FFV1/v210 validation may fail. "
                            f"See 'Supported FFmpeg versions' in MANUAL.md")
+
+def get_cli_version(cmd: List[str], pattern: str) -> Optional[str]:
+    """Run a tool's version command and return the last match of `pattern`
+    in its output (stdout and stderr), or None."""
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        matches = re.findall(pattern, result.stdout + result.stderr)
+        return matches[-1] if matches else None
+    except Exception:
+        return None
+
+def log_dependency_versions() -> None:
+    """Log every dependency's version and location, in the terminal and the
+    session log, so each run records exactly which toolchain produced it."""
+    logger = logging.getLogger('video_transcoder')
+    rows = []
+    for tool in ('ffmpeg', 'ffprobe'):
+        version, _ = get_tool_version(tool)
+        rows.append((tool, version or 'unknown', shutil.which(tool) or ''))
+    rows.append(('mediainfo', get_cli_version(['mediainfo', '--Version'], r'v(\d+(?:\.\d+)+)') or 'unknown',
+                 shutil.which('mediainfo') or ''))
+    if shutil.which('mediaconch'):
+        rows.append(('mediaconch', get_cli_version(['mediaconch', '--version'], r'(\d+\.\d+(?:\.\d+)?)') or 'unknown',
+                     shutil.which('mediaconch')))
+    else:
+        rows.append(('mediaconch', 'not found', 'policy conformance checks will be skipped'))
+    rows.append(('Python', platform.python_version(), sys.executable))
+    rows.append(('tqdm', getattr(tqdm_module, '__version__', 'unknown'), ''))
+    name_w = max(len(r[0]) for r in rows)
+    ver_w = max(len(r[1]) for r in rows)
+    lines = [f"  {name:<{name_w}}  {version:<{ver_w}}  {where}".rstrip() for name, version, where in rows]
+    logger.info("Dependencies:\n" + "\n".join(lines))
 
 # MediaInfo summary (GitHub issue #5): fields shown per file, in MediaInfo's own
 # text-output labels and formatting.
@@ -434,6 +499,25 @@ def format_mediainfo_summary(text: str) -> List[str]:
         lines.append(f"{name:<{width}} : {', '.join(p for p in parts if p)}")
     return lines
 
+def mediainfo_scan_type(summary_lines: List[str]) -> Optional[str]:
+    """'Interlaced' / 'Progressive' (etc.) from the summary's Scan type line."""
+    for line in summary_lines or []:
+        label, _, value = line.partition(' : ')
+        if label.strip() == 'Scan type':
+            return value.strip()
+    return None
+
+def scan_type_disagreement(summary_lines: List[str], interlaced: bool) -> Optional[str]:
+    """Return MediaInfo's scan type if it clearly contradicts vdg's interlaced/
+    progressive decision (only 'Interlaced' vs 'Progressive' — MBAFF/Mixed are
+    left alone), else None."""
+    mi = mediainfo_scan_type(summary_lines)
+    if mi == 'Interlaced' and not interlaced:
+        return mi
+    if mi == 'Progressive' and interlaced:
+        return mi
+    return None
+
 def get_mediainfo_summary(file_path: Path) -> Optional[List[str]]:
     """Run the mediainfo CLI and return summary lines, or None if it fails —
     a missing summary is logged as a warning and never fails the file."""
@@ -456,11 +540,10 @@ def check_dependencies() -> bool:
     if missing_required:
         return False
     logger.info("All required dependencies found")
+    log_dependency_versions()
     check_ffmpeg_version()
     if shutil.which('mediaconch') is None:
         logger.warning("mediaconch not found in PATH — policy conformance checks will be skipped")
-    else:
-        logger.info("mediaconch found — policy conformance checks enabled")
     return True
 
 def check_disk_space(output_dir: Path, required_gb: float = 10.0) -> bool:
@@ -549,6 +632,17 @@ def detect_variable_packet_durations(file_path: Path, timeout: int = 180) -> boo
         return False
 
 FIELD_ORDER_PROBE_FRAMES = 5
+# Where in the file to sample frames for field order (fractions of duration).
+# Sampling only the start failed on a real dvrescue capture whose first ~30 s
+# (blank/damaged tape head) decoded as progressive while the rest was BFF.
+FIELD_ORDER_PROBE_POSITIONS = (0.1, 0.3, 0.5, 0.7, 0.9)
+
+def field_order_read_intervals(duration: float) -> str:
+    """ffprobe -read_intervals spec: FIELD_ORDER_PROBE_FRAMES frames at each of
+    FIELD_ORDER_PROBE_POSITIONS, or from the start if the duration is unknown."""
+    if duration <= 0:
+        return f"%+#{FIELD_ORDER_PROBE_FRAMES}"
+    return ",".join(f"{duration * pos:.3f}%+#{FIELD_ORDER_PROBE_FRAMES}" for pos in FIELD_ORDER_PROBE_POSITIONS)
 
 def parse_dv_system(frame_bytes: bytes) -> Optional[str]:
     """Read the DV system from the start of a DV frame. The first DIF block is
@@ -589,11 +683,12 @@ def classify_frame_field_order(frames: List[Dict]) -> Optional[str]:
     tff = sum(1 for f in interlaced if int(f.get('top_field_first', 0)) == 1)
     return 'tff' if tff * 2 > len(interlaced) else 'bff'
 
-def detect_field_order_from_frames(file_path: Path, timeout: int = 60) -> Optional[str]:
+def detect_field_order_from_frames(file_path: Path, duration: float = 0.0, timeout: int = 60) -> Optional[str]:
     """Fallback scan detection for sources whose stream-level field_order is
     missing or 'unknown' — notably DV (raw .dv and dvrescue DV-in-MKV), where the
-    field order lives only in the decoded frames. Reads the first few frames."""
-    cmd = ['ffprobe', '-v', 'quiet', '-select_streams', 'v:0', '-read_intervals', f'%+#{FIELD_ORDER_PROBE_FRAMES}',
+    field order lives only in the decoded frames. Samples frames at several
+    points across the file and takes the majority."""
+    cmd = ['ffprobe', '-v', 'quiet', '-select_streams', 'v:0', '-read_intervals', field_order_read_intervals(duration),
            '-show_entries', 'frame=interlaced_frame,top_field_first', '-print_format', 'json', str(file_path)]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -653,9 +748,9 @@ def get_video_info(file_path: Path, warn: bool = True) -> VideoInfo:
     interlaced = field_order not in ['progressive', 'unknown']
     field_order_source, field_order_detail = 'stream', field_order
     if 'field_order' not in v_stream or field_order == 'unknown':
-        # Stream-level field order absent — fall back to first-frame metadata
+        # Stream-level field order absent — fall back to frame metadata sampled across the file
         # rather than silently assuming progressive (GitHub issue #9).
-        frame_order = detect_field_order_from_frames(file_path)
+        frame_order = detect_field_order_from_frames(file_path, duration)
         if frame_order is None:
             field_order_source, field_order_detail = 'none', ''
         else:
@@ -810,6 +905,57 @@ def validate_output(file_path: Path, timeout: int = VALIDATION_TIMEOUT) -> Tuple
     except Exception as e:
         return False, str(e)
 
+# v210 PAL policy — mirrors POLICY_V210_NTSC for 625-line/25 fps SD. SDI PAL is
+# top field first; primaries and matrix tagged bt470bg, which MediaInfo reports as
+# "BT.601 PAL" / "BT.470 System B/G" — the same tags vrecord writes on PAL captures
+# (the bt470bg and smpte170m matrices are numerically identical BT.601).
+# Added 2026-09-25, checked against a vrecord PAL VHS capture.
+POLICY_V210_PAL = """\
+<?xml version="1.0"?>
+<policy type="and" name="VDG v210 MOV Master (PAL SD)">
+  <description>10-bit Uncompressed v210 QuickTime MOV, PAL SD (720x576, 25.000fps, TFF).
+Audio must be PCM 24-bit 48kHz. Channel count and track count are not constrained.</description>
+  <rule name="Container is MPEG-4" value="Format" tracktype="General" occurrence="*" operator="=">MPEG-4</rule>
+  <rule name="Format profile is QuickTime" value="Format_Profile" tracktype="General" occurrence="*" operator="=">QuickTime</rule>
+  <rule name="File extension is mov" value="FileExtension" tracktype="General" occurrence="*" operator="=">mov</rule>
+  <rule name="Video codec is v210" value="CodecID" tracktype="Video" occurrence="*" operator="=">v210</rule>
+  <rule name="Video width is 720" value="Width" tracktype="Video" occurrence="*" operator="=">720</rule>
+  <rule name="Video height is 576" value="Height" tracktype="Video" occurrence="*" operator="=">576</rule>
+  <rule name="Video frame rate is 25.000" value="FrameRate" tracktype="Video" occurrence="*" operator="=">25.000</rule>
+  <rule name="Video standard is PAL" value="Standard" tracktype="Video" occurrence="*" operator="=">PAL</rule>
+  <rule name="Chroma subsampling is 4:2:2" value="ChromaSubsampling" tracktype="Video" occurrence="*" operator="=">4:2:2</rule>
+  <rule name="Bit depth is 10" value="BitDepth" tracktype="Video" occurrence="*" operator="=">10</rule>
+  <rule name="Scan type is Interlaced" value="ScanType" tracktype="Video" occurrence="*" operator="=">Interlaced</rule>
+  <rule name="Scan order is TFF" value="ScanOrder" tracktype="Video" occurrence="*" operator="=">TFF</rule>
+  <rule name="Color primaries is BT.601 PAL" value="colour_primaries" tracktype="Video" occurrence="*" operator="=">BT.601 PAL</rule>
+  <rule name="Transfer characteristics is BT.709" value="transfer_characteristics" tracktype="Video" occurrence="*" operator="=">BT.709</rule>
+  <rule name="Matrix coefficients is BT.470 System B/G" value="matrix_coefficients" tracktype="Video" occurrence="*" operator="=">BT.470 System B/G</rule>
+  <rule name="Audio format is PCM" value="Format" tracktype="Audio" occurrence="*" operator="=">PCM</rule>
+  <rule name="Audio is 24-bit" value="BitDepth" tracktype="Audio" occurrence="*" operator="=">24</rule>
+  <rule name="Audio sample rate is 48kHz" value="SamplingRate" tracktype="Audio" occurrence="*" operator="=">48000</rule>
+  <rule name="Audio is little-endian" value="Format_Settings_Endianness" tracktype="Audio" occurrence="*" operator="=">Little</rule>
+  <rule name="Audio is signed" value="Format_Settings_Sign" tracktype="Audio" occurrence="*" operator="=">Signed</rule>
+</policy>
+"""
+
+def policy_without_audio_rules(policy_xml: str) -> str:
+    """Remove every tracktype="Audio" rule from a MediaConch policy, plus any
+    sub-policy left empty by that (e.g. FFV1's "Audio is PCM or FLAC" block).
+    Used for sources with no audio track, where MediaConch otherwise fails every
+    audio rule — confirmed with MediaConch 25.04 on a silent v210 output."""
+    lines = [line for line in policy_xml.splitlines() if 'tracktype="Audio"' not in line]
+    xml = "\n".join(lines) + "\n"
+    return re.sub(r'\n[ \t]*<policy[^>]*>\s*</policy>', '', xml)
+
+def policy_without_dimension_rules(policy_xml: str) -> str:
+    """Remove the Width/Height rules from a MediaConch policy. Used for v210 with
+    --clean-aperture, where the output is display-cropped (e.g. 704x480) by
+    design and can never match the 720x486 NTSC master rule — every other rule
+    still applies."""
+    lines = [line for line in policy_xml.splitlines()
+             if not re.search(r'value="(Width|Height)"', line)]
+    return "\n".join(lines) + "\n"
+
 def run_validation_command_with_spinner(cmd: List[str], description: str, log_file: Optional[Path] = None) -> Tuple[bool, str]:
     if log_file:
         try:
@@ -826,22 +972,24 @@ def run_validation_command_with_spinner(cmd: List[str], description: str, log_fi
     thread = threading.Thread(target=run_command)
     thread.daemon = True
     thread.start()
+    # Drawn as a tqdm line (not raw stdout writes) so it coexists with the
+    # "Total Progress" bar instead of leaving stale copies of it behind.
     idx = 0
-    sys.stdout.write(f"    {description} ")
-    sys.stdout.flush()
+    spin_line = tqdm(total=0, bar_format="    {desc}", desc=description, leave=False,
+                     dynamic_ncols=True)
     while not result_container['done']:
-        sys.stdout.write(f"\r    {description} {spinner[idx % len(spinner)]}")
-        sys.stdout.flush()
+        spin_line.set_description_str(f"{description} {spinner[idx % len(spinner)]}")
         time.sleep(0.1)
         idx += 1
-    sys.stdout.write(f"\r    {description} ✓\n")
-    sys.stdout.flush()
+    spin_line.close()
     thread.join()
     result = result_container['result']
+    console_write(f"    {description} {'✓' if result.returncode == 0 else '✗'}")
     return (result.returncode == 0), result.stdout
 
 def run_mediaconch_check(output_path: Path, policy_xml: str, policy_filename: str,
-                         log_dir: Path, process_log: Path, keep_policy: bool) -> Tuple[bool, str]:
+                         log_dir: Path, process_log: Path, keep_policy: bool,
+                         has_audio: bool = True, skip_dimensions: bool = False) -> Tuple[bool, str]:
     """Write embedded policy XML to log_dir, run mediaconch against output_path,
     log the result to process_log, and optionally retain the policy file."""
     logger = logging.getLogger('video_transcoder')
@@ -849,6 +997,10 @@ def run_mediaconch_check(output_path: Path, policy_xml: str, policy_filename: st
         logger.warning("mediaconch not found — skipping policy conformance check")
         return True, "mediaconch not available — check skipped"
     policy_path = log_dir / policy_filename
+    if not has_audio:
+        policy_xml = policy_without_audio_rules(policy_xml)
+    if skip_dimensions:
+        policy_xml = policy_without_dimension_rules(policy_xml)
     try:
         policy_path.write_text(policy_xml, encoding='utf-8')
         cmd = ['mediaconch', f'--Policy={str(policy_path)}', str(output_path)]
@@ -860,7 +1012,9 @@ def run_mediaconch_check(output_path: Path, policy_xml: str, policy_filename: st
             log_f.write("MEDIACONCH POLICY CHECK\n")
             log_f.write("=" * 70 + "\n")
             log_f.write(f"Command: {shlex.join(cmd)}\n")
-            log_f.write(f"Policy:  {policy_filename}\n")
+            omitted = ([] if has_audio else ["audio rules omitted — no audio stream in source"]) + \
+                      (["width/height rules omitted — --clean-aperture output"] if skip_dimensions else [])
+            log_f.write(f"Policy:  {policy_filename}{' (' + '; '.join(omitted) + ')' if omitted else ''}\n")
             log_f.write(f"File:    {output_path.name}\n")
             log_f.write(f"Result:  {'PASS' if passed else 'FAIL'}\n")
             log_f.write(f"Output:  {mc_output}\n")
@@ -937,7 +1091,10 @@ def validate_v210_lossless(source_path: Path, output_path: Path, process_log: Pa
         else:
             logger.info("  → Generating hash for source audio stream(s)...")
         cmd_source_audio = ['ffmpeg', '-i', str(source_path), '-map', '0:a', '-f', 'streamhash', '-hash', 'md5', '-']
-        success, source_audio_hash = run_validation_command_with_spinner(cmd_source_audio, "Hashing source audio", process_log)
+        if has_audio:
+            success, source_audio_hash = run_validation_command_with_spinner(cmd_source_audio, "Hashing source audio", process_log)
+        else:
+            success, source_audio_hash = False, ""
         audio_passed = False
         source_audio_hash = source_audio_hash.strip() if success else ""
         output_audio_hash = ""
@@ -992,11 +1149,22 @@ def validate_v210_lossless(source_path: Path, output_path: Path, process_log: Pa
 
         logger.info(f"  ✓ v210 lossless validation PASSED for {source_path.name}")
 
-        # MediaConch policy check — NTSC only for now
-        if video_standard == VideoStandard.NTSC:
+        # MediaConch policy check — per video standard
+        v210_policy = {VideoStandard.NTSC: (POLICY_V210_NTSC, "policy_v210_ntsc.xml"),
+                       VideoStandard.PAL: (POLICY_V210_PAL, "policy_v210_pal.xml")}.get(video_standard)
+        if v210_policy:
+            if clean_aperture:
+                # Display-cropped by request; flag it clearly rather than letting
+                # the 720x486 rule quarantine every --clean-aperture v210.
+                dims = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                                       '-show_entries', 'stream=width,height', '-of', 'csv=p=0:s=x',
+                                       str(output_path)], capture_output=True, text=True).stdout.strip()
+                standard_size = "720x486 NTSC" if video_standard == VideoStandard.NTSC else "720x576 PAL"
+                logger.warning(f"  --clean-aperture: v210 output is display-cropped ({dims or 'non-standard size'}), "
+                               f"not a standard {standard_size} master — MediaConch width/height rules skipped")
             mc_passed, mc_msg = run_mediaconch_check(
-                output_path, POLICY_V210_NTSC, "policy_v210_ntsc.xml",
-                log_dir, process_log, keep_mediaconch)
+                output_path, v210_policy[0], v210_policy[1],
+                log_dir, process_log, keep_mediaconch, has_audio, skip_dimensions=clean_aperture)
             if not mc_passed:
                 return False, f"MediaConch policy check failed: {mc_msg}"
         else:
@@ -1267,9 +1435,12 @@ def process_v210_output(source_path: Path, output_path: Path, info: VideoInfo, v
     try:
         setfield = "bff" if video_standard == VideoStandard.NTSC else "tff"
         setsar = "10/11" if video_standard == VideoStandard.NTSC else "12/11"
+        # Primaries/matrix per standard — previously smpte170m (NTSC) was written
+        # for PAL too. Transfer stays bt709, matching vrecord masters.
+        color_std = "smpte170m" if video_standard == VideoStandard.NTSC else "bt470bg"
         cmd = ["ffmpeg", "-y"] + clean_aperture_input_args(clean_aperture) + ["-i", str(source_path),
                "-movflags", "write_colr", "-c:v", "v210",
-               "-color_primaries", "smpte170m", "-color_trc", "bt709", "-colorspace", "smpte170m",
+               "-color_primaries", color_std, "-color_trc", "bt709", "-colorspace", color_std,
                "-color_range", "mpeg", "-metadata:s:v:0", "encoder=Uncompressed 10-bit 4:2:2",
                "-vf", f"setfield={setfield},setsar={setsar},setdar=4/3",
                # 0:a? — optional, so sources with no audio track don't fail the encode
@@ -1290,10 +1461,33 @@ def process_v210_output(source_path: Path, output_path: Path, info: VideoInfo, v
         logger.error(f"v210 processing error: {e}")
         return False
 
-def process_prores_output(source_path: Path, output_path: Path, info: VideoInfo, process_log: Path) -> bool:
+def prores_interlace_args(info: VideoInfo, force_scan: Optional[str] = None) -> List[str]:
+    """ffmpeg args so interlaced sources become interlaced ProRes. Without
+    +ildct, prores_ks encodes every frame progressive and flags it so in the
+    ProRes frame header, even when the container is labelled TFF/BFF (found
+    testing DdD TFF material, 2026-09-25). prores_ks takes field dominance from
+    each frame's flags, so setfield pins it whenever vdg's decision didn't come
+    from the stream itself: --force-scan, or the frame-sampling fallback (where
+    some frames — e.g. a damaged tape head — carry no field flags at all)."""
+    if not info.interlaced:
+        return []
+    args = ["-flags", "+ildct"]
+    if force_scan in ('tff', 'bff'):
+        order = force_scan
+    elif info.field_order_source == 'frames' and info.field_order_detail in ('tff', 'bff'):
+        order = info.field_order_detail
+    else:
+        order = None
+    if order:
+        args += ["-vf", f"setfield={order}"]
+    return args
+
+def process_prores_output(source_path: Path, output_path: Path, info: VideoInfo, process_log: Path,
+                          force_scan: Optional[str] = None) -> bool:
     try:
         cmd = ["ffmpeg", "-y", "-i", str(source_path), "-codec:v", "prores_ks", "-profile:v", "3",
-               "-vtag", "apch", "-metadata:s", "encoder=Apple ProRes 422 HQ", "-vendor", "apl0",
+               "-vtag", "apch"] + prores_interlace_args(info, force_scan) + [
+               "-metadata:s", "encoder=Apple ProRes 422 HQ", "-vendor", "apl0",
                "-codec:a", "copy", "-map", "0:v", "-map", "0:a?", str(output_path)]
         success, _ = run_ffmpeg_with_progress(cmd, info.total_frames, f"ProRes: {source_path.name[:20]}", process_log)
         return success
@@ -1356,7 +1550,10 @@ def validate_ffv1_lossless(source_path: Path, output_path: Path, process_log: Pa
         else:
             logger.info("  → Generating hash for source audio stream(s)...")
         cmd_source_audio = ['ffmpeg', '-i', str(source_path), '-map', '0:a', '-f', 'streamhash', '-hash', 'md5', '-']
-        success, source_audio_hash = run_validation_command_with_spinner(cmd_source_audio, "Hashing source audio", process_log)
+        if has_audio:
+            success, source_audio_hash = run_validation_command_with_spinner(cmd_source_audio, "Hashing source audio", process_log)
+        else:
+            success, source_audio_hash = False, ""
         audio_passed = False
         source_audio_hash = source_audio_hash.strip() if success else ""
         output_audio_hash = ""
@@ -1414,7 +1611,7 @@ def validate_ffv1_lossless(source_path: Path, output_path: Path, process_log: Pa
         # MediaConch policy check
         mc_passed, mc_msg = run_mediaconch_check(
             output_path, POLICY_FFV1, "policy_ffv1.xml",
-            log_dir, process_log, keep_mediaconch)
+            log_dir, process_log, keep_mediaconch, has_audio)
         if not mc_passed:
             return False, f"MediaConch policy check failed: {mc_msg}"
 
@@ -1577,7 +1774,7 @@ def process_single_video(source_path: Path, config: Config, completed_set: Set[s
         if config.force_scan is None:
             if info.field_order_source == 'frames':
                 interlace_status += (f", {info.field_order_detail.upper()}" if info.interlaced else "") + \
-                    " — from first-frame metadata, no stream field order"
+                    " — from frame metadata sampled across the file, no stream field order"
             elif info.field_order_source == 'none':
                 interlace_status += " — assumed, no field order metadata"
                 logger.warning(f"{base_name}: no field order in stream or frame metadata — treating as "
@@ -1586,6 +1783,11 @@ def process_single_video(source_path: Path, config: Config, completed_set: Set[s
         mediainfo_summary = get_mediainfo_summary(source_path)
         if mediainfo_summary:
             logger.info(f"MediaInfo — {base_name}\n" + "\n".join(mediainfo_summary) + "\n")
+            mi_scan = scan_type_disagreement(mediainfo_summary, info.interlaced) if config.force_scan is None else None
+            if mi_scan:
+                logger.warning(f"{base_name}: scan type disagreement — vdg is treating the source as "
+                               f"{'interlaced' if info.interlaced else 'progressive'}, but MediaInfo reports {mi_scan}. "
+                               f"Check the output, or rerun with --force-scan (tff/bff/progressive)")
         else:
             logger.warning(f"MediaInfo summary unavailable for {base_name}")
         
@@ -1621,17 +1823,17 @@ def process_single_video(source_path: Path, config: Config, completed_set: Set[s
             if not process_v210_output(source_path, output_paths['v210'], info, video_standard,
                                        process_log, config.log_dir, config.keep_framemd5, config.keep_mediaconch,
                                        config.clean_aperture, config.keep_failed):
-                raise Exception("v210 encoding failed")
+                raise Exception("v210 transcode or validation failed")
         if config.output_prores:
             logger.info(f"Encoding ProRes for {base_name}")
-            if not process_prores_output(source_path, output_paths['prores'], info, process_log):
+            if not process_prores_output(source_path, output_paths['prores'], info, process_log, config.force_scan):
                 raise Exception("ProRes encoding failed")
         if config.output_ffv1:
             logger.info(f"Encoding FFV1/MKV for {base_name}")
             if not process_ffv1_output(source_path, output_paths['ffv1'], info,
                                        process_log, config.log_dir, config.keep_framemd5, config.keep_mediaconch,
                                        config.clean_aperture, config.keep_failed):
-                raise Exception("FFV1 encoding failed")
+                raise Exception("FFV1 transcode or validation failed")
         
         if config.move_finished and not config.dry_run:
             shutil.move(str(source_path), str(config.finished_dir / base_name))
@@ -1722,7 +1924,7 @@ def print_live_status(files: List[Path], session_completed: Set[str], stats: Pro
     status_lines.append(f"{success_str} | {skipped_str} | {quarantined_str} | {error_str}")
     status_lines.append("=" * 70 + "\n")
     for line in status_lines:
-        tqdm.write(line)
+        console_write(line)
 
 def print_summary(stats: ProcessingStats, start_time: datetime):
     logger = logging.getLogger('video_transcoder')
@@ -1744,18 +1946,24 @@ def print_summary(stats: ProcessingStats, start_time: datetime):
         for failed in stats.failed_files:
             print(f"  {Colors.RED}✗{Colors.RESET} {failed}")
         print()
-    logger.info("=" * 70 + "\nPROCESSING SUMMARY\n" + "=" * 70)
-    logger.info(f"Total files:      {stats.total}\nSuccessful:       {stats.success}\nSkipped:          {stats.skipped}\nQuarantined:      {stats.quarantined}\nErrors:           {stats.error}\nProcessing time:  {duration}\n" + "=" * 70)
+    # Same summary for the session log only — the terminal already has the
+    # colored version printed above.
+    file_only = {'file_only': True}
+    logger.info("=" * 70 + "\nPROCESSING SUMMARY\n" + "=" * 70, extra=file_only)
+    logger.info(f"Total files:      {stats.total}\nSuccessful:       {stats.success}\nSkipped:          {stats.skipped}\nQuarantined:      {stats.quarantined}\nErrors:           {stats.error}\nProcessing time:  {duration}\n" + "=" * 70, extra=file_only)
     if stats.quarantined_files:
-        logger.warning("QUARANTINED FILES:")
+        logger.warning("QUARANTINED FILES:", extra=file_only)
         for quarantined in stats.quarantined_files:
-            logger.warning(f"  - {quarantined}")
+            logger.warning(f"  - {quarantined}", extra=file_only)
     if stats.failed_files:
-        logger.error("FAILED FILES:")
+        logger.error("FAILED FILES:", extra=file_only)
         for failed in stats.failed_files:
-            logger.error(f"  - {failed}")
-    if stats.error == 0:
+            logger.error(f"  - {failed}", extra=file_only)
+    if stats.error == 0 and stats.quarantined == 0:
         logger.info("JOB COMPLETED SUCCESSFULLY - All files processed without errors")
+    elif stats.error == 0:
+        logger.warning(f"JOB COMPLETED WITH QUARANTINED FILES - {stats.success} succeeded, "
+                       f"{stats.quarantined} quarantined for review")
     elif stats.success > 0:
         logger.warning(f"JOB COMPLETED WITH ERRORS - {stats.success} succeeded, {stats.error} failed")
     else:

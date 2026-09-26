@@ -26,10 +26,19 @@ from vdg.cli import (
     parse_mediainfo_text,
     format_mediainfo_summary,
     classify_frame_field_order,
+    field_order_read_intervals,
+    scan_type_disagreement,
+    prores_interlace_args,
+    VideoInfo,
     parse_dv_system,
     dv_nominal_fps,
     add_audio_async_filter,
     AUDIO_ASYNC_FILTER,
+    policy_without_audio_rules,
+    policy_without_dimension_rules,
+    POLICY_FFV1,
+    POLICY_V210_NTSC,
+    POLICY_V210_PAL,
     VideoStandard,
     ROLE_CODES,
 )
@@ -547,3 +556,80 @@ class TestAddAudioAsyncFilter:
     def test_appended_inside_filter_complex(self):
         out = add_audio_async_filter(["-filter_complex", "[0:a:0][0:a:1]amerge=inputs=2[aout]", "-map", "[aout]"])
         assert out == ["-filter_complex", f"[0:a:0][0:a:1]amerge=inputs=2,{AUDIO_ASYNC_FILTER}[aout]", "-map", "[aout]"]
+
+
+# ---------------------------------------------------------------------------
+# policy_without_audio_rules (MediaConch on sources with no audio track)
+# ---------------------------------------------------------------------------
+
+import xml.etree.ElementTree as ET
+
+class TestPolicyWithoutAudioRules:
+    @pytest.mark.parametrize("policy", [POLICY_FFV1, POLICY_V210_NTSC, POLICY_V210_PAL])
+    def test_no_audio_rules_and_still_valid_xml(self, policy):
+        stripped = policy_without_audio_rules(policy)
+        root = ET.fromstring(stripped.encode())
+        assert not [r for r in root.iter("rule") if r.get("tracktype") == "Audio"]
+        video_rules = [r for r in ET.fromstring(policy.encode()).iter("rule") if r.get("tracktype") != "Audio"]
+        assert len([r for r in root.iter("rule")]) == len(video_rules)
+
+    def test_ffv1_empty_audio_subpolicy_removed(self):
+        root = ET.fromstring(policy_without_audio_rules(POLICY_FFV1).encode())
+        assert not [p for p in root.iter("policy") if len(list(p)) == 0]
+        assert "Audio is PCM or FLAC" not in policy_without_audio_rules(POLICY_FFV1)
+
+    def test_dimension_rules_removed_others_kept(self):
+        stripped = policy_without_dimension_rules(POLICY_V210_NTSC)
+        rules = list(ET.fromstring(stripped.encode()).iter("rule"))
+        assert not [r for r in rules if r.get("value") in ("Width", "Height")]
+        original = list(ET.fromstring(POLICY_V210_NTSC.encode()).iter("rule"))
+        assert len(rules) == len(original) - 2
+
+
+class TestFieldOrderSampling:
+    def test_intervals_spread_across_file(self):
+        spec = field_order_read_intervals(3600.0)
+        assert spec == "360.000%+#5,1080.000%+#5,1800.000%+#5,2520.000%+#5,3240.000%+#5"
+
+    def test_unknown_duration_reads_from_start(self):
+        assert field_order_read_intervals(0) == "%+#5"
+
+    def test_damaged_head_outvoted(self):
+        head = [{"interlaced_frame": 0, "top_field_first": 0}] * 5
+        body = [{"interlaced_frame": 1, "top_field_first": 0}] * 20
+        assert classify_frame_field_order(head + body) == "bff"
+
+
+class TestScanTypeDisagreement:
+    LINES = ["Width                : 720 pixels", "Scan type            : Interlaced"]
+
+    def test_flags_interlaced_treated_as_progressive(self):
+        assert scan_type_disagreement(self.LINES, interlaced=False) == "Interlaced"
+
+    def test_agreement_is_none(self):
+        assert scan_type_disagreement(self.LINES, interlaced=True) is None
+
+    def test_mbaff_ignored(self):
+        assert scan_type_disagreement(["Scan type            : MBAFF"], interlaced=False) is None
+
+    def test_missing_scan_type(self):
+        assert scan_type_disagreement(["Width : 720 pixels"], interlaced=False) is None
+
+
+class TestProresInterlaceArgs:
+    def _info(self, interlaced, source="stream", detail="tt"):
+        return VideoInfo(width=720, height=486, duration=10, fps=29.97, dar="4:3", has_audio=True,
+                         total_frames=300, codec="ffv1", interlaced=interlaced, is_vfr=False,
+                         is_quicktime=False, field_order_source=source, field_order_detail=detail)
+
+    def test_progressive_untouched(self):
+        assert prores_interlace_args(self._info(False)) == []
+
+    def test_stream_field_order_relies_on_frame_flags(self):
+        assert prores_interlace_args(self._info(True)) == ["-flags", "+ildct"]
+
+    def test_frame_sampled_order_pinned(self):
+        assert prores_interlace_args(self._info(True, "frames", "bff")) == ["-flags", "+ildct", "-vf", "setfield=bff"]
+
+    def test_force_scan_wins(self):
+        assert prores_interlace_args(self._info(True, "frames", "bff"), "tff") == ["-flags", "+ildct", "-vf", "setfield=tff"]
