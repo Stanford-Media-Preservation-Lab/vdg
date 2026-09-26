@@ -70,7 +70,7 @@ INFO: Dependencies:
 
 | Platform | FFmpeg | How it's installed |
 |----------|--------|--------------------|
-| macOS (Apple Silicon) | 7.1.x | Homebrew `ffmpeg@7`, pinned with `brew pin ffmpeg@7`, first on `PATH` |
+| macOS (Apple Silicon) | 7.1.x | Homebrew `ffmpeg@7`, pinned with `brew pin ffmpeg@7`, put on vdg's `PATH` by the `vdg` shell alias. Homebrew's regular `ffmpeg` stays installed for vrecord/AMIA tools |
 | Ubuntu 24.04 | 6.1.x | Stock Ubuntu `ffmpeg` package, held with `apt-mark hold ffmpeg` |
 
 **FFmpeg 9.x is not supported.** On macOS it has broken ffprobe JSON parsing and FFV1 → v210 lossless transcodes (framemd5 validation failures). Newer FFmpeg releases will be adopted only after they've been tested against lossless FFV1/v210 round-trips on both platforms. See [INSTALL_MACOS.md](INSTALL_MACOS.md) and [INSTALL_UBUNTU.md](INSTALL_UBUNTU.md) for installation and pinning.
@@ -794,7 +794,7 @@ Check the process log for the specific frame numbers where the mismatch occurred
 
 ### Lossless validation fails on files that used to pass, or ffprobe errors on every file
 
-Check the FFmpeg version first: `which ffmpeg && ffmpeg -version | head -1`. If it reports 8.x or 9.x, a `brew upgrade` or a third-party PPA has replaced the pinned build. Reinstall per [Supported FFmpeg versions](#supported-ffmpeg-versions) — on macOS, confirm `/opt/homebrew/opt/ffmpeg@7/bin` is at the front of `PATH` in a new terminal.
+Check the FFmpeg version first: `which ffmpeg && ffmpeg -version | head -1`. If it reports 8.x or 9.x, a `brew upgrade` or a third-party PPA has replaced the pinned build. Reinstall per [Supported FFmpeg versions](#supported-ffmpeg-versions). On macOS, check the startup dependency list: if `ffmpeg` isn't under `/opt/homebrew/opt/ffmpeg@7/bin`, vdg ran without its alias (e.g. `\vdg`), or the alias is missing its `PATH=` prefix. `which ffmpeg` in a plain terminal showing Homebrew's regular FFmpeg is expected.
 
 ### "mediaconch not found in PATH — policy conformance checks will be skipped"
 

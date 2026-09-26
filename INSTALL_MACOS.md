@@ -14,58 +14,51 @@ If not already installed:
 
 ---
 
-## 2. Install FFmpeg 7 (pinned)
+## 2. Install FFmpeg 7 (pinned, for vdg only)
 
-> **Use FFmpeg 7 only.** FFmpeg 9.x breaks `vdg` on macOS — ffprobe JSON parsing and FFV1/v210 lossless round-trips (framemd5 validation failures) have both been observed. Do **not** use the unversioned `ffmpeg` formula or the `homebrew-ffmpeg/ffmpeg` tap: both track the latest FFmpeg release and will move you to 9.x on the next `brew upgrade`.
+> **vdg uses FFmpeg 7 only.** FFmpeg 9.x breaks `vdg` on macOS: both ffprobe JSON parsing and FFV1/v210 lossless round-trips (framemd5 validation failures) have been observed. Homebrew's versioned `ffmpeg@7` formula stays on the 7.1.x series, and its bottle (Sequoia and Tahoe, Apple Silicon) includes everything `vdg` needs: `libx264`, `libopenjpeg` (JPEG 2000 thumbnails) and AudioToolbox (`aac_at`).
 
-Homebrew's versioned `ffmpeg@7` formula stays on the 7.1.x series and its bottle already includes everything `vdg` needs — `libx264`, `libopenjpeg` (JPEG 2000 thumbnails), and AudioToolbox (`aac_at`). No tap or source build is required.
+**Leave Homebrew's regular `ffmpeg` installed.** vrecord and other AMIA Open Source tools depend on it (`brew uninstall ffmpeg` refuses while they're installed), and they should keep using the current Homebrew FFmpeg they were built against. So `ffmpeg@7` is **not** put on the global `PATH`. vdg gets it through its shell alias instead, and every other command in Terminal is unaffected.
 
-### New machine
+### Install and pin
 
 ```bash
 brew install ffmpeg@7
 brew pin ffmpeg@7
 ```
 
-`ffmpeg@7` is *keg-only* — Homebrew does not put it on your `PATH` automatically. Add it to the front of `PATH` in `~/.zshrc`:
+`ffmpeg@7` is *keg-only*: Homebrew installs it in `/opt/homebrew/opt/ffmpeg@7/bin` without linking it into `/opt/homebrew/bin`. Leave it that way.
+
+### Point vdg at it: the alias
+
+Add one `vdg` alias to `~/.zshrc` (`nano ~/.zshrc`) that sets the PATH for vdg's own run only, plus the machine's default folders:
 
 ```bash
-echo 'export PATH="/opt/homebrew/opt/ffmpeg@7/bin:$PATH"' >> ~/.zshrc
-source ~/.zshrc
+alias vdg='PATH="/opt/homebrew/opt/ffmpeg@7/bin:$PATH" command vdg --source-dir /Volumes/<drive>/source --output-dir /Volumes/<drive>/output'
 ```
 
-### Machine that already has a newer FFmpeg
-
-Check what is installed and whether anything else depends on it:
+Keep it on a line of its own. If a file doesn't end with a line break, text appended with `echo >>` gets glued onto the previous line. Remove any earlier global `export PATH="/opt/homebrew/opt/ffmpeg@7/bin:$PATH"` line, then check:
 
 ```bash
-ffmpeg -version | head -1
-brew list --versions ffmpeg ffmpeg@7
-brew uses --installed ffmpeg
+sed -i '' '/^export PATH="\/opt\/homebrew\/opt\/ffmpeg@7/d' ~/.zshrc
+grep -n "ffmpeg@7" ~/.zshrc
 ```
 
-If `brew uses` prints nothing, remove the unversioned formula (use the fully qualified name if it came from the tap):
+`grep` should show only the alias line. Open a new Terminal window.
 
-```bash
-brew uninstall ffmpeg                           # Homebrew core
-brew uninstall homebrew-ffmpeg/ffmpeg/ffmpeg    # or, if installed from the tap
-```
-
-If another formula depends on `ffmpeg`, leave it installed — the `PATH` line above puts `ffmpeg@7` ahead of it, which is all `vdg` needs.
-
-Then install, pin and add to `PATH` exactly as for a new machine.
+Running `\vdg`, `command vdg` or vdg's full path bypasses the alias and picks up Homebrew's regular (9.x) FFmpeg. vdg's startup version warning will flag it.
 
 ### Verify
 
-Open a **new** terminal and confirm the right binaries are first on `PATH`:
+In a new Terminal window:
 
 ```bash
-which ffmpeg ffprobe             # both should be /opt/homebrew/opt/ffmpeg@7/bin/...
-ffmpeg -version | head -1        # should report 7.1.x
-ffmpeg -hide_banner -encoders | grep -E "libx264|libopenjpeg|aac_at"
+which ffmpeg
+/opt/homebrew/opt/ffmpeg@7/bin/ffmpeg -version | head -1
+/opt/homebrew/opt/ffmpeg@7/bin/ffmpeg -hide_banner -encoders | grep -E "libx264|libopenjpeg|aac_at"
 ```
 
-All three encoders should be listed.
+`which ffmpeg` should still show `/opt/homebrew/bin/ffmpeg`: that's the regular FFmpeg for vrecord, and it's expected. `ffmpeg@7` should report 7.1.x and list all three encoders. Then start any `vdg` job: its startup dependency list should show `ffmpeg 7.1.x /opt/homebrew/opt/ffmpeg@7/bin/ffmpeg` with no FFmpeg warning.
 
 ### About pinning
 
@@ -81,7 +74,7 @@ brew pin ffmpeg@7
 
 If `brew upgrade` later updates a library `ffmpeg@7` links against (e.g. `x264`, `openjpeg`) and `ffmpeg` fails to launch with a `dyld: Library not loaded` error, run `brew reinstall ffmpeg@7` to relink it.
 
-> **vrecord / dvrescue:** vrecord uses its own keg-only `ffmpegdecklink` build and is unaffected by any of this.
+> **vrecord / AMIA tools:** they keep using Homebrew's regular `ffmpeg` (and vrecord its `ffmpegdecklink` build for capture). Nothing in this section changes what they run.
 
 ---
 

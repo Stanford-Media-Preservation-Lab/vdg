@@ -41,6 +41,10 @@ At **v1.4.2**. This round of work (v1.4.0 → v1.4.2) is closed out — no fixes
 
 ## In progress — v1.5.0
 
+**macOS FFmpeg approach changed (2026-09-26):** Homebrew's regular `ffmpeg` (9.x) can't be removed on lab Macs because vrecord and other AMIA tools depend on it, and Michael won't risk changing what those tools run. So `ffmpeg@7` is NOT put on the global PATH. The `vdg` alias sets it per-run: `alias vdg='PATH="/opt/homebrew/opt/ffmpeg@7/bin:$PATH" command vdg --source-dir … --output-dir …'`. `\vdg` bypasses it (the startup warning flags that). INSTALL_MACOS.md, MANUAL and the rollout checklist doc are updated. Possible v1.5.1 improvement: have vdg prepend `/opt/homebrew/opt/ffmpeg@7/bin` to its own PATH when present, so it doesn't depend on the alias.
+
+**Rollout gotcha (video1, 2026-09-26):** `echo '...' >> ~/.zshrc` appended the ffmpeg@7 PATH line onto the last line (the `vdg` alias) because `.zshrc` had no trailing newline. The PATH line never ran (FFmpeg 9.0.1 stayed first) and the alias's `--output-dir` gained `export` on the end. The install guide and rollout checklist now use `printf '\nexport PATH=...\n' >> ~/.zshrc` + `tail -2`.
+
 ### Real-file test round (2026-09-25/26, Michael's laptop: M4 Pro, macOS, ffmpeg@7 7.1.5, MediaInfo 26.05, MediaConch 25.04)
 
 Test files are in `~/Desktop/vdg_test/01_source/t*`, outputs in `02_destination/`.
