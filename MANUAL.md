@@ -34,8 +34,8 @@
 
 The script is designed around two distinct intake pipelines:
 
-- **Tape digitization** — FFV1/MKV preservation masters produced by the SMPL digitization workflow from analog formats (Betacam SP, Digital Betacam, VHS, U-matic, Hi8, DV)
-- **Acquired digital content** — born-digital HD deliverables from vendors and distributors
+- **Tape digitization** — FFV1/MKV preservation masters produced by the SMPL digitization workflow from analog formats (e.g., Betacam SP, Digital Betacam, VHS, U-matic, Hi8, DV, etc.)
+- **Acquired digital content** — Deliverables from vendors and distributors, which could be digitzed from tape by some other service, or have no known provenance, or may be born-digital camera files or produced content for distribution.
 
 Four output formats are available: `-h264`, `-v210`, `-prores`, `-ffv1`. At least one must be specified on every invocation; they may be combined freely (e.g. `-ffv1 -h264` to generate a preservation master and an access copy in the same pass).
 
