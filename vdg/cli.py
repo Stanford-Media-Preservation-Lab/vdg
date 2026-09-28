@@ -31,7 +31,7 @@ from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 SCRIPT_TITLE = "Stanford Media Preservation Lab"
-SCRIPT_NAME = "Video Derivative Generator, v1.5.0, September 2026"
+SCRIPT_NAME = "Video Derivative Generator, v1.6.0, September 2026"
 SCRIPT_SEPARATOR = "----"
 
 # Highest FFmpeg major version vdg has been validated against (lossless
@@ -102,7 +102,12 @@ VIDEO_EXTENSIONS = (
 
 BITRATE_CONFIG = {
     'sd': {'bitrate': '1000k', 'maxrate': '1200k', 'bufsize': '2000k'},
-    'hd': {'bitrate': '2800k', 'maxrate': '2900k', 'bufsize': '5800k'}
+    'hd': {'bitrate': '2800k', 'maxrate': '2900k', 'bufsize': '5800k'},
+    # Desktop review derivatives (--desktop-review): higher bitrate than the
+    # _sl access copy above, since these are meant to look good on a projector
+    # or a meeting-room display, not just stream cleanly.
+    'desktop_sd': {'bitrate': '9000k', 'maxrate': '9500k', 'bufsize': '18000k'},
+    'desktop_hd': {'bitrate': '18000k', 'maxrate': '19000k', 'bufsize': '36000k'}
 }
 
 THUMBNAIL_POSITIONS = [0.10, 0.40, 0.60, 0.90]
@@ -142,9 +147,17 @@ Audio format is PCM or FLAC.</description>
 # NTSC; see POLICY_V210_PAL for the PAL equivalent.
 POLICY_V210_NTSC = """\
 <?xml version="1.0"?>
-<policy type="and" name="VDG v210 MOV Master (NTSC SD)">
+<policy type="and" name="VDG v210 MOV Master (NTSC SD) — Apple TN2162 conformant">
   <description>10-bit Uncompressed v210 QuickTime MOV, NTSC SD (720x486, 29.970fps, BFF).
-Audio must be PCM 24-bit 48kHz. Channel count and track count are not constrained.</description>
+Audio must be PCM 24-bit 48kHz. Channel count and track count are not constrained.
+Asserts conformance with Apple TN2162 ("Uncompressed Y'CbCr Video in QuickTime
+Files") for the colr atom (colour_primaries/transfer_characteristics/matrix_coefficients
+rules below), the fiel atom (ScanType/ScanOrder rules below), and the pasp atom
+(PixelAspectRatio rule below). The clap (clean aperture) atom is NOT asserted here:
+vdg's default (--clean-aperture not passed) preserves the full coded frame with no
+display/coded size mismatch, so there is nothing for a clap atom to declare —
+clap conformance only applies when --clean-aperture is used, and isn't currently
+checked by this policy (see MANUAL.md).</description>
   <rule name="Container is MPEG-4" value="Format" tracktype="General" occurrence="*" operator="=">MPEG-4</rule>
   <rule name="Format profile is QuickTime" value="Format_Profile" tracktype="General" occurrence="*" operator="=">QuickTime</rule>
   <rule name="File extension is mov" value="FileExtension" tracktype="General" occurrence="*" operator="=">mov</rule>
@@ -160,6 +173,21 @@ Audio must be PCM 24-bit 48kHz. Channel count and track count are not constraine
   <rule name="Color primaries is BT.601 NTSC" value="colour_primaries" tracktype="Video" occurrence="*" operator="=">BT.601 NTSC</rule>
   <rule name="Transfer characteristics is BT.709" value="transfer_characteristics" tracktype="Video" occurrence="*" operator="=">BT.709</rule>
   <rule name="Matrix coefficients is BT.601" value="matrix_coefficients" tracktype="Video" occurrence="*" operator="=">BT.601</rule>
+  <!-- TN2162 pasp atom (pixel aspect ratio). vdg encodes setsar=10/11 (vrecord's
+       own recommended NTSC 4:3 default, per vrecord's Config > Aspect Ratio
+       tab). MediaConch has no three-state result, so this passes on ANY of
+       vrecord's four user-configurable NTSC 4:3 PAR values (720x486 D-1) —
+       vdg's own output warns separately (Python-level, not MediaConch) when
+       the actual value isn't vrecord's default. 2026-09-28: corrected from an
+       earlier single-value 0.900 rule, which reflected a since-fixed
+       setdar=4/3 bug that silently overrode setsar on every v210 output
+       (see process_v210_output) rather than any legitimate PAR target. -->
+  <policy type="or" name="Pixel aspect ratio is a vrecord-acceptable NTSC 4:3 value">
+    <rule name="PAR is 0.909 (10/11, vrecord default)" value="PixelAspectRatio" tracktype="Video" occurrence="*" operator="=">0.909</rule>
+    <rule name="PAR is 0.889 (8/9)" value="PixelAspectRatio" tracktype="Video" occurrence="*" operator="=">0.889</rule>
+    <rule name="PAR is 0.900 (9/10)" value="PixelAspectRatio" tracktype="Video" occurrence="*" operator="=">0.900</rule>
+    <rule name="PAR is 0.912 (4320/4739)" value="PixelAspectRatio" tracktype="Video" occurrence="*" operator="=">0.912</rule>
+  </policy>
   <rule name="Audio format is PCM" value="Format" tracktype="Audio" occurrence="*" operator="=">PCM</rule>
   <rule name="Audio is 24-bit" value="BitDepth" tracktype="Audio" occurrence="*" operator="=">24</rule>
   <rule name="Audio sample rate is 48kHz" value="SamplingRate" tracktype="Audio" occurrence="*" operator="=">48000</rule>
@@ -272,6 +300,7 @@ class Config:
         self.output_v210 = args.v210
         self.output_prores = args.prores
         self.output_ffv1 = args.ffv1
+        self.output_desktop_review = args.desktop_review
         self.audio_stream = args.audio_stream
         self.audio_mode = args.audio_mode
         self.audio_pan_center = args.audio_pan_center
@@ -291,11 +320,12 @@ class Config:
         # JP2 thumbnails without encoding a derivative. Sources are left in place
         # (never moved to finished_sources) and nothing is recorded in the resume
         # CSV, since the source has normally already been processed.
-        any_format = self.output_h264 or self.output_v210 or self.output_prores or self.output_ffv1
+        any_format = (self.output_h264 or self.output_v210 or self.output_prores or self.output_ffv1
+                      or self.output_desktop_review)
         self.thumbs_only = not any_format and self.thumb_count is not None
         if not any_format and not self.thumbs_only:
-            raise ConfigError("At least one output format must be specified (-h264, -v210, -prores, or -ffv1), "
-                              "or --thumbs N on its own to generate thumbnails only")
+            raise ConfigError("At least one output format must be specified (-h264, -v210, -prores, -ffv1, "
+                              "or -desktop-review), or --thumbs N on its own to generate thumbnails only")
         if self.thumbs_only:
             if self.thumb_count < 1:
                 raise ConfigError("--thumbs must be at least 1 when generating thumbnails only")
@@ -517,6 +547,50 @@ def scan_type_disagreement(summary_lines: List[str], interlaced: bool) -> Option
     if mi == 'Progressive' and interlaced:
         return mi
     return None
+
+# vrecord's user-configurable Config > Aspect Ratio values (per Michael's
+# screenshot, 2026-09-28), rounded to 3dp to match MediaInfo's PixelAspectRatio
+# formatting. vdg's v210 encode always targets the *_DEFAULT value via
+# -vf setsar=... in process_v210_output; MediaConch's POLICY_V210_NTSC/PAL pass
+# on any value in the corresponding *_ACCEPTABLE set (nested OR sub-policy) and
+# fail on anything else. This dict-based check is a separate, non-MediaConch
+# warning for the middle tier: acceptable-but-not-vrecord's-default, which
+# MediaConch's binary pass/fail can't distinguish on its own.
+V210_PAR_NTSC_DEFAULT = 0.909  # 10/11
+V210_PAR_NTSC_ACCEPTABLE = {0.909: "10/11 (default)", 0.889: "8/9", 0.900: "9/10", 0.912: "4320/4739"}
+V210_PAR_PAL_DEFAULT = 1.091  # 12/11
+V210_PAR_PAL_ACCEPTABLE = {1.091: "12/11 (default)", 1.067: "16/15", 1.094: "128/117"}
+
+def par_default_mismatch(output_path: Path, video_standard: VideoStandard) -> Optional[str]:
+    """Read the v210 output's actual PixelAspectRatio via ffprobe and, if it's a
+    vrecord-acceptable value other than vrecord's own default for this standard,
+    return a description of the mismatch for a Python-level warning (not a
+    MediaConch failure — MediaConch already passes any vrecord-acceptable value,
+    see POLICY_V210_NTSC/PAL). Returns None if the PAR matches the default, or
+    if it couldn't be read (that case is left to MediaConch, which will fail the
+    file outright if the PAR is truly outside the acceptable set)."""
+    try:
+        result = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                                 '-show_entries', 'stream=sample_aspect_ratio',
+                                 '-of', 'csv=p=0', str(output_path)],
+                                capture_output=True, text=True, timeout=MEDIAINFO_TIMEOUT)
+        sar = result.stdout.strip()
+        if result.returncode != 0 or not sar or ':' not in sar:
+            return None
+        num, den = sar.split(':', 1)
+        par = float(num) / float(den)
+    except Exception:
+        return None
+    default, acceptable = {
+        VideoStandard.NTSC: (V210_PAR_NTSC_DEFAULT, V210_PAR_NTSC_ACCEPTABLE),
+        VideoStandard.PAL: (V210_PAR_PAL_DEFAULT, V210_PAR_PAL_ACCEPTABLE),
+    }.get(video_standard, (None, None))
+    if default is None:
+        return None
+    match = min(acceptable, key=lambda v: abs(v - par)) if any(abs(v - par) < 0.002 for v in acceptable) else None
+    if match is None or abs(match - default) < 0.0005:
+        return None
+    return f"PAR {match:.3f} ({acceptable[match]}) — vrecord default for this standard is {default:.3f}"
 
 def get_mediainfo_summary(file_path: Path) -> Optional[List[str]]:
     """Run the mediainfo CLI and return summary lines, or None if it fails —
@@ -912,9 +986,17 @@ def validate_output(file_path: Path, timeout: int = VALIDATION_TIMEOUT) -> Tuple
 # Added 2026-09-25, checked against a vrecord PAL VHS capture.
 POLICY_V210_PAL = """\
 <?xml version="1.0"?>
-<policy type="and" name="VDG v210 MOV Master (PAL SD)">
+<policy type="and" name="VDG v210 MOV Master (PAL SD) — Apple TN2162 conformant">
   <description>10-bit Uncompressed v210 QuickTime MOV, PAL SD (720x576, 25.000fps, TFF).
-Audio must be PCM 24-bit 48kHz. Channel count and track count are not constrained.</description>
+Audio must be PCM 24-bit 48kHz. Channel count and track count are not constrained.
+Asserts conformance with Apple TN2162 ("Uncompressed Y'CbCr Video in QuickTime
+Files") for the colr atom (colour_primaries/transfer_characteristics/matrix_coefficients
+rules below), the fiel atom (ScanType/ScanOrder rules below), and the pasp atom
+(PixelAspectRatio rule below — UNVERIFIED, see comment on that rule). The clap
+(clean aperture) atom is NOT asserted here: vdg's default (--clean-aperture not
+passed) preserves the full coded frame with no display/coded size mismatch, so
+there is nothing for a clap atom to declare — clap conformance only applies when
+--clean-aperture is used, and isn't currently checked by this policy (see MANUAL.md).</description>
   <rule name="Container is MPEG-4" value="Format" tracktype="General" occurrence="*" operator="=">MPEG-4</rule>
   <rule name="Format profile is QuickTime" value="Format_Profile" tracktype="General" occurrence="*" operator="=">QuickTime</rule>
   <rule name="File extension is mov" value="FileExtension" tracktype="General" occurrence="*" operator="=">mov</rule>
@@ -930,6 +1012,20 @@ Audio must be PCM 24-bit 48kHz. Channel count and track count are not constraine
   <rule name="Color primaries is BT.601 PAL" value="colour_primaries" tracktype="Video" occurrence="*" operator="=">BT.601 PAL</rule>
   <rule name="Transfer characteristics is BT.709" value="transfer_characteristics" tracktype="Video" occurrence="*" operator="=">BT.709</rule>
   <rule name="Matrix coefficients is BT.470 System B/G" value="matrix_coefficients" tracktype="Video" occurrence="*" operator="=">BT.470 System B/G</rule>
+  <!-- TN2162 pasp atom (pixel aspect ratio). vdg encodes setsar=12/11 (vrecord's
+       own recommended PAL 4:3 default, per vrecord's Config > Aspect Ratio
+       tab). MediaConch has no three-state result, so this passes on ANY of
+       vrecord's three user-configurable PAL 4:3 PAR values (720x576 D-1) —
+       vdg's own output warns separately (Python-level, not MediaConch) when
+       the actual value isn't vrecord's default. 2026-09-28: corrected from an
+       earlier single-value 1.067 rule, which reflected a since-fixed
+       setdar=4/3 bug that silently overrode setsar on every v210 output
+       (see process_v210_output) rather than any legitimate PAR target. -->
+  <policy type="or" name="Pixel aspect ratio is a vrecord-acceptable PAL 4:3 value">
+    <rule name="PAR is 1.091 (12/11, vrecord default)" value="PixelAspectRatio" tracktype="Video" occurrence="*" operator="=">1.091</rule>
+    <rule name="PAR is 1.067 (16/15)" value="PixelAspectRatio" tracktype="Video" occurrence="*" operator="=">1.067</rule>
+    <rule name="PAR is 1.094 (128/117)" value="PixelAspectRatio" tracktype="Video" occurrence="*" operator="=">1.094</rule>
+  </policy>
   <rule name="Audio format is PCM" value="Format" tracktype="Audio" occurrence="*" operator="=">PCM</rule>
   <rule name="Audio is 24-bit" value="BitDepth" tracktype="Audio" occurrence="*" operator="=">24</rule>
   <rule name="Audio sample rate is 48kHz" value="SamplingRate" tracktype="Audio" occurrence="*" operator="=">48000</rule>
@@ -1167,6 +1263,11 @@ def validate_v210_lossless(source_path: Path, output_path: Path, process_log: Pa
                 log_dir, process_log, keep_mediaconch, has_audio, skip_dimensions=clean_aperture)
             if not mc_passed:
                 return False, f"MediaConch policy check failed: {mc_msg}"
+            if not clean_aperture:
+                par_msg = par_default_mismatch(output_path, video_standard)
+                if par_msg:
+                    logger.warning(f"  {output_path.name}: {par_msg} — passes TN2162/MediaConch (vrecord-acceptable), "
+                                   f"but doesn't match vrecord's own default for this standard")
         else:
             logger.info("  → MediaConch policy check skipped (no policy defined for this video standard)")
 
@@ -1357,6 +1458,121 @@ def process_h264_output(source_path: Path, output_path: Path, info: VideoInfo, c
         logging.getLogger('video_transcoder').error(f"H264 processing error: {e}")
         return False
 
+DESKTOP_REVIEW_SD_SIZE = (720, 540)
+# Proportional 4:3 fit before pillarboxing to the 1920x1080 HD frame.
+DESKTOP_REVIEW_HD_FIT = (1440, 1080)
+
+def _desktop_review_vf_chain(info: VideoInfo, config: Config, target_width: int, target_height: int,
+                             pillarbox: bool) -> str:
+    """Build the bwdif+scale(+pad) filter chain for one desktop-review variant.
+    Parity mirrors process_h264_output's logic: explicit from --force-scan,
+    else -1 for ffmpeg/bwdif's own per-frame auto-detection."""
+    if pillarbox:
+        scale_part = (f"scale={target_width}:{target_height}:flags=lanczos,"
+                      f"pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black")
+    else:
+        scale_part = f"scale={target_width}:{target_height}:flags=lanczos"
+    if info.interlaced:
+        if config.force_scan == 'tff':
+            parity = 0
+        elif config.force_scan == 'bff':
+            parity = 1
+        else:
+            parity = -1
+        return f"bwdif=mode=0:parity={parity}:deint=all,{scale_part},setsar=1,format=yuv420p"
+    return f"{scale_part},setsar=1,format=yuv420p"
+
+def _encode_desktop_review_variant(source_path: Path, output_path: Path, info: VideoInfo, config: Config,
+                                   process_log: Path, stats_log_prefix: Path, vf_chain: str, out_fps: float,
+                                   bitrate_cfg: Dict[str, str], label: str) -> bool:
+    """Two-pass H.264 encode for one desktop-review variant (SD or HD). Shares
+    process_h264_output's separate video/audio-mux structure (GitHub issue #10
+    — encoding slow x264 video and near-instant AAC audio in the same ffmpeg
+    process silently dropped audio partway through long files)."""
+    gop = math.ceil(out_fps * GOP_MULTIPLIER)
+    audio_mapping, audio_filter_args, audio_description = build_audio_filter_and_mapping(config, info)
+    with open(process_log, 'a') as log_f:
+        log_f.write(f"[{label}] Audio Configuration: {audio_description}\n")
+        log_f.write(f"[{label}] AAC Encoder: {config.aac_encoder}\n")
+        log_f.write(f"[{label}] Filter chain: {vf_chain}\n")
+
+    video_mapping = ["-map", "0:v:0"]
+    video_codec_args = ["-c:v", "libx264", "-preset", "medium", "-profile:v", "high", "-fps_mode", "cfr",
+                       "-r", f"{out_fps:.3f}", "-g", str(gop), "-sc_threshold", "0", "-vf", vf_chain,
+                       "-b:v", bitrate_cfg['bitrate'], "-maxrate", bitrate_cfg['maxrate'], "-bufsize", bitrate_cfg['bufsize']]
+    audio_codec_args = ["-c:a", config.aac_encoder, "-ac", "2", "-ar", "48000", "-b:a", "192k"] if info.has_audio else ["-an"]
+
+    pass1_cmd = ["ffmpeg", "-y", "-i", str(source_path)] + video_mapping + video_codec_args + \
+                ["-pass", "1", "-passlogfile", str(stats_log_prefix), "-an", "-f", "mp4", os.devnull]
+    success, _ = run_ffmpeg_with_progress(pass1_cmd, info.total_frames, f"{label} Pass 1: {source_path.name[:20]}", process_log)
+    if not success:
+        return False
+
+    pass2_video_args = video_codec_args + ["-pass", "2", "-passlogfile", str(stats_log_prefix), "-tune", "film"]
+    if not info.has_audio:
+        pass2_cmd = ["ffmpeg", "-y", "-i", str(source_path)] + video_mapping + pass2_video_args + \
+                    ["-an", "-movflags", "faststart", str(output_path)]
+        success, _ = run_ffmpeg_with_progress(pass2_cmd, info.total_frames, f"{label} Pass 2: {source_path.name[:20]}", process_log)
+        if not success:
+            return False
+    else:
+        temp_video = stats_log_prefix.parent / f"{output_path.stem}_video_tmp.mp4"
+        pass2_cmd = ["ffmpeg", "-y", "-i", str(source_path)] + video_mapping + pass2_video_args + \
+                    ["-an", str(temp_video)]
+        success, _ = run_ffmpeg_with_progress(pass2_cmd, info.total_frames, f"{label} Pass 2: {source_path.name[:20]}", process_log)
+        if not success:
+            logging.getLogger('video_transcoder').error(
+                f"{label} pass 2 failed — audio mux skipped; partial video left for inspection: {temp_video}")
+            return False
+        mux_cmd = ["ffmpeg", "-y", "-i", str(source_path), "-i", str(temp_video), "-map", "1:v:0"]
+        mux_cmd += audio_mapping + add_audio_async_filter(audio_filter_args)
+        mux_cmd += ["-c:v", "copy"] + audio_codec_args + \
+                   ["-max_interleave_delta", "0", "-movflags", "faststart", str(output_path)]
+        success, _ = run_ffmpeg_with_progress(mux_cmd, info.total_frames, f"{label} Audio Mux: {source_path.name[:20]}", process_log)
+        if not success:
+            logging.getLogger('video_transcoder').error(
+                f"{label} audio mux failed — video-only encode left for inspection: {temp_video}")
+            return False
+        try:
+            temp_video.unlink()
+        except Exception as e:
+            logging.getLogger('video_transcoder').warning(f"Failed to delete {temp_video}: {e}")
+
+    if not config.skip_validation:
+        is_valid, err_msg = validate_output(output_path)
+        if not is_valid:
+            logging.getLogger('video_transcoder').error(f"{label} validation failed: {err_msg}")
+            return False
+    return True
+
+def process_desktop_review_output(source_path: Path, output_paths: Dict[str, Path], info: VideoInfo,
+                                  video_standard: VideoStandard, config: Config, process_log: Path,
+                                  sd_stats_prefix: Path, hd_stats_prefix: Path) -> bool:
+    """Desktop review derivatives: a curator/artist/writer viewing copy for a
+    meeting or presentation, not a preservation/access derivative. Produces:
+      _ds — 720x540 square-pixel full-frame SD (720:540 == 4:3 exactly, no pad)
+      _dh — 1920x1080 pillarboxed HD upconversion from a 4:3 source
+    Output frame rate is fixed to the detected standard's rate (29.97p NTSC /
+    25p PAL) rather than derived from the source fps, same convention as the
+    v210 NTSC/PAL policy split. Caller must have already confirmed
+    video_standard is NTSC or PAL (not UNKNOWN)."""
+    out_fps = 29.970 if video_standard == VideoStandard.NTSC else 25.0
+
+    sd_w, sd_h = DESKTOP_REVIEW_SD_SIZE
+    sd_vf = _desktop_review_vf_chain(info, config, sd_w, sd_h, pillarbox=False)
+    if not _encode_desktop_review_variant(source_path, output_paths['desktop_sd'], info, config,
+                                          process_log, sd_stats_prefix, sd_vf, out_fps,
+                                          BITRATE_CONFIG['desktop_sd'], "Desktop SD"):
+        return False
+
+    hd_fit_w, hd_fit_h = DESKTOP_REVIEW_HD_FIT
+    hd_vf = _desktop_review_vf_chain(info, config, hd_fit_w, hd_fit_h, pillarbox=True)
+    if not _encode_desktop_review_variant(source_path, output_paths['desktop_hd'], info, config,
+                                          process_log, hd_stats_prefix, hd_vf, out_fps,
+                                          BITRATE_CONFIG['desktop_hd'], "Desktop HD"):
+        return False
+    return True
+
 def generate_thumbnail_set(source_path: Path, output_dir: Path, thumbnail_prefix: str, info: VideoInfo, config: Config,
                            scale_string: str, parity: int, process_log: Path) -> bool:
     """Generate the full set of JP2 thumbnails for one source: 4 at standard
@@ -1434,6 +1650,8 @@ def process_v210_output(source_path: Path, output_path: Path, info: VideoInfo, v
     logger = logging.getLogger('video_transcoder')
     try:
         setfield = "bff" if video_standard == VideoStandard.NTSC else "tff"
+        # vrecord's configurable per-standard PAR (Config > Aspect Ratio tab);
+        # 10/11 (NTSC) / 12/11 (PAL) are vrecord's own recommended defaults.
         setsar = "10/11" if video_standard == VideoStandard.NTSC else "12/11"
         # Primaries/matrix per standard — previously smpte170m (NTSC) was written
         # for PAL too. Transfer stays bt709, matching vrecord masters.
@@ -1442,7 +1660,17 @@ def process_v210_output(source_path: Path, output_path: Path, info: VideoInfo, v
                "-movflags", "write_colr", "-c:v", "v210",
                "-color_primaries", color_std, "-color_trc", "bt709", "-colorspace", color_std,
                "-color_range", "mpeg", "-metadata:s:v:0", "encoder=Uncompressed 10-bit 4:2:2",
-               "-vf", f"setfield={setfield},setsar={setsar},setdar=4/3",
+               # setdar=4/3 was REMOVED here (2026-09-28 bug fix): it silently
+               # recalculated and overrode setsar to whatever value produces an
+               # exact 4:3 DAR for the frame's actual pixel dimensions (9/10 for
+               # 720x486 NTSC, 16/15 for 720x576 PAL) — discarding the intended
+               # vrecord-matching setsar value above on every v210 file this
+               # code has ever produced. setsar alone fully determines display
+               # geometry; DAR is derived by any player from SAR + coded
+               # dimensions, never an independently muxed value. Confirmed via
+               # ffprobe: setsar alone gives SAR 10:11 / DAR 400:297 (NTSC);
+               # with setdar=4/3 it silently became SAR 9:10 / DAR 4:3 instead.
+               "-vf", f"setfield={setfield},setsar={setsar}",
                # 0:a? — optional, so sources with no audio track don't fail the encode
                "-c:a", "pcm_s24le", "-map", "0:v", "-map", "0:a?", "-f", "mov", str(output_path)]
         success, _ = run_ffmpeg_with_progress(cmd, info.total_frames, f"v210: {source_path.name[:20]}", process_log)
@@ -1671,7 +1899,7 @@ def process_ffv1_output(source_path: Path, output_path: Path, info: VideoInfo,
         logger.error(f"FFV1 processing error: {e}")
         return False
 
-ROLE_CODES = ('_pm', '_sh', '_sl')
+ROLE_CODES = ('_pm', '_sh', '_sl', '_ds', '_dh')
 
 def sanitize_filename(name: str) -> str:
     """Replace spaces with underscores in a filename stem."""
@@ -1713,6 +1941,12 @@ def process_single_video(source_path: Path, config: Config, completed_set: Set[s
         output_paths['ffv1'] = config.output_dir / f"{base_stem}_pm.mkv"
     else:
         output_paths['ffv1'] = None
+    if config.output_desktop_review:
+        output_paths['desktop_sd'] = config.output_dir / f"{base_stem}_ds.mp4"
+        output_paths['desktop_hd'] = config.output_dir / f"{base_stem}_dh.mp4"
+    else:
+        output_paths['desktop_sd'] = None
+        output_paths['desktop_hd'] = None
     
     thumbnail_prefix = base_stem if (config.output_h264 or config.thumbs_only) else None
     num_thumbs = config.thumb_count if config.thumb_count is not None else len(THUMBNAIL_POSITIONS)
@@ -1724,6 +1958,8 @@ def process_single_video(source_path: Path, config: Config, completed_set: Set[s
     
     process_log = config.log_dir / f"{root_name}_process.log"
     stats_log_prefix = config.log_dir / f"stats_{root_name}"
+    desktop_sd_stats_prefix = config.log_dir / f"stats_{root_name}_ds"
+    desktop_hd_stats_prefix = config.log_dir / f"stats_{root_name}_dh"
     audio_status = "Unknown"
     
     try:
@@ -1834,6 +2070,13 @@ def process_single_video(source_path: Path, config: Config, completed_set: Set[s
                                        process_log, config.log_dir, config.keep_framemd5, config.keep_mediaconch,
                                        config.clean_aperture, config.keep_failed):
                 raise Exception("FFV1 transcode or validation failed")
+        if config.output_desktop_review:
+            logger.info(f"Encoding desktop review derivatives for {base_name}")
+            if video_standard == VideoStandard.UNKNOWN:
+                raise Exception("Cannot create desktop review output: video is not NTSC or PAL SD 4:3 standard")
+            if not process_desktop_review_output(source_path, output_paths, info, video_standard, config,
+                                                 process_log, desktop_sd_stats_prefix, desktop_hd_stats_prefix):
+                raise Exception("Desktop review encoding failed")
         
         if config.move_finished and not config.dry_run:
             shutil.move(str(source_path), str(config.finished_dir / base_name))
@@ -1871,6 +2114,9 @@ def process_single_video(source_path: Path, config: Config, completed_set: Set[s
     finally:
         if config.output_h264:
             cleanup_temp_files(stats_log_prefix)
+        if config.output_desktop_review:
+            cleanup_temp_files(desktop_sd_stats_prefix)
+            cleanup_temp_files(desktop_hd_stats_prefix)
 
 def collect_video_files(source_dir: Path, finished_dir: Path) -> List[Path]:
     files = []
@@ -2078,7 +2324,14 @@ def process_batch(config: Config) -> ProcessingStats:
     return stats
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='Video Transcoding and Archival Pipeline', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
+        """Keeps the multi-line banner in --description intact while still showing
+        per-argument default values (the two base formatters don't conflict)."""
+        pass
+
+    parser = argparse.ArgumentParser(
+        description=f"{SCRIPT_TITLE}\n{SCRIPT_NAME}\n{SCRIPT_SEPARATOR}\n\nVideo Transcoding and Archival Pipeline",
+        formatter_class=_HelpFormatter)
     parser.add_argument('--version', action='version', version=SCRIPT_NAME)
     parser.add_argument('--source-dir', type=str, default='/Users/mangelet/Desktop/In_Progress/1/source', help='Source directory containing video files')
     parser.add_argument('--output-dir', type=str, default='/Users/mangelet/Desktop/In_Progress/1/output', help='Output directory for processed files')
@@ -2117,6 +2370,10 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument('-v210', action='store_true', help='Generate v210 uncompressed 10-bit 4:2:2 QuickTime output (.mov)')
     parser.add_argument('-prores', action='store_true', help='Generate ProRes 422 HQ QuickTime output (_sh.mov)')
     parser.add_argument('-ffv1', action='store_true', help='Generate FFV1 v3 lossless MKV output (_pm.mkv) with framemd5 validation')
+    parser.add_argument('-desktop-review', action='store_true',
+                        help='Generate desktop review derivatives for curator/artist/writer viewing copies: '
+                             '720x540 square-pixel SD (_ds.mp4) and 1920x1080 pillarboxed HD upconversion (_dh.mp4). '
+                             'Requires an NTSC or PAL SD 4:3 source.')
     audio_group = parser.add_argument_group('Audio Configuration (H.264 only)')
     audio_group.add_argument('--audio-stream', type=str, default='0:a:0', help='Audio stream to use (default: 0:a:0). Examples: 0:a:0, 0:a:1')
     audio_group.add_argument('--audio-mode', type=str, choices=['stereo', 'mono-duplicate', 'mono-merge'], default='stereo', help='Audio processing mode: stereo (default), mono-duplicate, mono-merge')

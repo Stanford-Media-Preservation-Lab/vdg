@@ -41,7 +41,18 @@ from vdg.cli import (
     POLICY_V210_PAL,
     VideoStandard,
     ROLE_CODES,
+    _desktop_review_vf_chain,
+    DESKTOP_REVIEW_SD_SIZE,
+    DESKTOP_REVIEW_HD_FIT,
+    BITRATE_CONFIG,
+    par_default_mismatch,
+    V210_PAR_NTSC_DEFAULT,
+    V210_PAR_NTSC_ACCEPTABLE,
+    V210_PAR_PAL_DEFAULT,
+    V210_PAR_PAL_ACCEPTABLE,
 )
+from unittest.mock import patch, MagicMock
+import types
 
 
 # ---------------------------------------------------------------------------
@@ -633,3 +644,193 @@ class TestProresInterlaceArgs:
 
     def test_force_scan_wins(self):
         assert prores_interlace_args(self._info(True, "frames", "bff"), "tff") == ["-flags", "+ildct", "-vf", "setfield=tff"]
+
+
+# ---------------------------------------------------------------------------
+# --desktop-review: filter chain construction, suffixes, bitrate config
+# ---------------------------------------------------------------------------
+
+class TestDesktopReviewVfChain:
+    def _info(self, interlaced, source="stream", detail="bt"):
+        return VideoInfo(width=720, height=486, duration=10, fps=29.97, dar="4:3", has_audio=True,
+                         total_frames=300, codec="ffv1", interlaced=interlaced, is_vfr=False,
+                         is_quicktime=False, field_order_source=source, field_order_detail=detail)
+
+    def _config(self, force_scan=None):
+        return types.SimpleNamespace(force_scan=force_scan)
+
+    def test_sd_progressive_no_bwdif(self):
+        vf = _desktop_review_vf_chain(self._info(False), self._config(), 720, 540, pillarbox=False)
+        assert "bwdif" not in vf
+        assert "scale=720:540:flags=lanczos" in vf
+        assert "pad=" not in vf
+
+    def test_sd_interlaced_auto_parity(self):
+        vf = _desktop_review_vf_chain(self._info(True), self._config(), 720, 540, pillarbox=False)
+        assert "bwdif=mode=0:parity=-1:deint=all" in vf
+        assert "scale=720:540:flags=lanczos" in vf
+
+    def test_sd_interlaced_force_scan_tff(self):
+        vf = _desktop_review_vf_chain(self._info(True), self._config(force_scan='tff'), 720, 540, pillarbox=False)
+        assert "parity=0" in vf
+
+    def test_sd_interlaced_force_scan_bff(self):
+        vf = _desktop_review_vf_chain(self._info(True), self._config(force_scan='bff'), 720, 540, pillarbox=False)
+        assert "parity=1" in vf
+
+    def test_hd_pillarbox_present(self):
+        vf = _desktop_review_vf_chain(self._info(True), self._config(), 1440, 1080, pillarbox=True)
+        assert "scale=1440:1080:flags=lanczos" in vf
+        assert "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black" in vf
+
+    def test_sd_no_pillarbox(self):
+        # SD target (720x540) is exactly 4:3 already — no pad should ever appear
+        vf = _desktop_review_vf_chain(self._info(True), self._config(), 720, 540, pillarbox=False)
+        assert "pad=" not in vf
+
+    def test_always_square_pixel_yuv420p(self):
+        vf = _desktop_review_vf_chain(self._info(True), self._config(), 720, 540, pillarbox=False)
+        assert vf.endswith("setsar=1,format=yuv420p")
+
+
+class TestDesktopReviewConstants:
+    def test_sd_size_is_exact_4x3(self):
+        w, h = DESKTOP_REVIEW_SD_SIZE
+        assert w == 720 and h == 540
+        assert w / h == pytest.approx(4 / 3)
+
+    def test_hd_fit_is_exact_4x3(self):
+        w, h = DESKTOP_REVIEW_HD_FIT
+        assert w == 1440 and h == 1080
+        assert w / h == pytest.approx(4 / 3)
+
+    def test_role_codes_include_desktop_review(self):
+        assert '_ds' in ROLE_CODES
+        assert '_dh' in ROLE_CODES
+
+
+class TestDesktopReviewBitrateConfig:
+    def test_desktop_sd_present(self):
+        assert 'desktop_sd' in BITRATE_CONFIG
+        assert BITRATE_CONFIG['desktop_sd']['bitrate'] == '9000k'
+
+    def test_desktop_hd_present(self):
+        assert 'desktop_hd' in BITRATE_CONFIG
+        assert BITRATE_CONFIG['desktop_hd']['bitrate'] == '18000k'
+
+    def test_desktop_bitrates_higher_than_service_low(self):
+        # Desktop review is a projector/meeting-room viewing copy, meant to
+        # look better than the streaming _sl access copy, not just parse.
+        sd_kbps = int(BITRATE_CONFIG['desktop_sd']['bitrate'].rstrip('k'))
+        hd_kbps = int(BITRATE_CONFIG['desktop_hd']['bitrate'].rstrip('k'))
+        sl_sd_kbps = int(BITRATE_CONFIG['sd']['bitrate'].rstrip('k'))
+        sl_hd_kbps = int(BITRATE_CONFIG['hd']['bitrate'].rstrip('k'))
+        assert sd_kbps > sl_sd_kbps
+        assert hd_kbps > sl_hd_kbps
+
+
+# ---------------------------------------------------------------------------
+# TN2162 (pasp) rule presence in the v210 policies
+# ---------------------------------------------------------------------------
+
+class TestTN2162PixelAspectRatioRule:
+    """PAR is a nested <policy type="or"> sub-policy (2026-09-28): MediaConch
+    passes on any vrecord-acceptable value for the standard, since MediaConch
+    itself has no three-state (default/acceptable/fail) result. The middle tier
+    — acceptable but not vrecord's own default — is a separate Python-level
+    warning, see TestParDefaultMismatch below."""
+
+    def _par_sub_policy(self, policy_xml):
+        root = ET.fromstring(policy_xml)
+        sub_policies = [p for p in root.findall('policy') if p.get('type') == 'or']
+        par_policies = [p for p in sub_policies
+                        if any(r.get('value') == 'PixelAspectRatio' for r in p.findall('rule'))]
+        assert len(par_policies) == 1, "expected exactly one PAR OR sub-policy"
+        return par_policies[0]
+
+    def test_ntsc_policy_has_par_or_subpolicy_with_four_values(self):
+        sub = self._par_sub_policy(POLICY_V210_NTSC)
+        values = {r.text for r in sub.findall('rule') if r.get('value') == 'PixelAspectRatio'}
+        assert values == {'0.909', '0.889', '0.900', '0.912'}
+
+    def test_ntsc_par_default_value_present(self):
+        sub = self._par_sub_policy(POLICY_V210_NTSC)
+        values = {r.text for r in sub.findall('rule')}
+        assert f'{V210_PAR_NTSC_DEFAULT:.3f}' in values
+
+    def test_pal_policy_has_par_or_subpolicy_with_three_values(self):
+        sub = self._par_sub_policy(POLICY_V210_PAL)
+        values = {r.text for r in sub.findall('rule') if r.get('value') == 'PixelAspectRatio'}
+        assert values == {'1.091', '1.067', '1.094'}
+
+    def test_pal_par_default_value_present(self):
+        sub = self._par_sub_policy(POLICY_V210_PAL)
+        values = {r.text for r in sub.findall('rule')}
+        assert f'{V210_PAR_PAL_DEFAULT:.3f}' in values
+
+    def test_both_policies_cite_tn2162_in_name(self):
+        for policy in (POLICY_V210_NTSC, POLICY_V210_PAL):
+            root = ET.fromstring(policy)
+            assert 'TN2162' in root.get('name')
+
+    def test_par_or_subpolicy_nested_inside_outer_and_policy(self):
+        # Confirms the sub-policy is actually nested (same proven pattern as
+        # POLICY_FFV1's "Audio is PCM or FLAC" sub-policy), not a sibling.
+        for policy in (POLICY_V210_NTSC, POLICY_V210_PAL):
+            root = ET.fromstring(policy)
+            assert root.get('type') == 'and'
+            direct_children = list(root)
+            par_subpolicies = [c for c in direct_children if c.tag == 'policy' and c.get('type') == 'or'
+                               and any(r.get('value') == 'PixelAspectRatio' for r in c.findall('rule'))]
+            assert len(par_subpolicies) == 1
+
+
+class TestParDefaultMismatch:
+    """par_default_mismatch(): the Python-level warning for the middle tier —
+    a vrecord-acceptable PAR that isn't vrecord's own default for the standard."""
+
+    def _ffprobe_result(self, sar_text, returncode=0):
+        result = MagicMock()
+        result.returncode = returncode
+        result.stdout = sar_text
+        return result
+
+    def test_default_ntsc_par_returns_none(self):
+        with patch('vdg.cli.subprocess.run', return_value=self._ffprobe_result('10:11')):
+            assert par_default_mismatch(Path('out.mov'), VideoStandard.NTSC) is None
+
+    def test_non_default_acceptable_ntsc_par_warns(self):
+        with patch('vdg.cli.subprocess.run', return_value=self._ffprobe_result('9:10')):
+            msg = par_default_mismatch(Path('out.mov'), VideoStandard.NTSC)
+        assert msg is not None
+        assert '9/10' in msg
+        assert '0.909' in msg  # cites the vrecord default it doesn't match
+
+    def test_default_pal_par_returns_none(self):
+        with patch('vdg.cli.subprocess.run', return_value=self._ffprobe_result('12:11')):
+            assert par_default_mismatch(Path('out.mov'), VideoStandard.PAL) is None
+
+    def test_non_default_acceptable_pal_par_warns(self):
+        with patch('vdg.cli.subprocess.run', return_value=self._ffprobe_result('16:15')):
+            msg = par_default_mismatch(Path('out.mov'), VideoStandard.PAL)
+        assert msg is not None
+        assert '16/15' in msg
+
+    def test_par_outside_acceptable_set_returns_none(self):
+        # Genuinely out-of-spec values are MediaConch's job (hard fail), not a
+        # soft Python warning — this function only distinguishes among the
+        # already-acceptable set.
+        with patch('vdg.cli.subprocess.run', return_value=self._ffprobe_result('1:1')):
+            assert par_default_mismatch(Path('out.mov'), VideoStandard.NTSC) is None
+
+    def test_unparseable_ffprobe_output_returns_none(self):
+        with patch('vdg.cli.subprocess.run', return_value=self._ffprobe_result('')):
+            assert par_default_mismatch(Path('out.mov'), VideoStandard.NTSC) is None
+
+    def test_ffprobe_failure_returns_none(self):
+        with patch('vdg.cli.subprocess.run', return_value=self._ffprobe_result('10:11', returncode=1)):
+            assert par_default_mismatch(Path('out.mov'), VideoStandard.NTSC) is None
+
+    def test_unknown_video_standard_returns_none(self):
+        with patch('vdg.cli.subprocess.run', return_value=self._ffprobe_result('9:10')):
+            assert par_default_mismatch(Path('out.mov'), VideoStandard.UNKNOWN) is None

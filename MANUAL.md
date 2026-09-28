@@ -37,7 +37,7 @@ The script is designed around two distinct intake pipelines:
 - **Tape digitization** — FFV1/MKV preservation masters produced by the SMPL digitization workflow from analog formats (e.g., Betacam SP, Digital Betacam, VHS, U-matic, Hi8, DV, etc.)
 - **Acquired digital content** — Deliverables from vendors and distributors, which could be digitzed from tape by some other service, or have no known provenance, or may be born-digital camera files or produced content for distribution.
 
-Four output formats are available: `-h264`, `-v210`, `-prores`, `-ffv1`. At least one must be specified on every invocation; they may be combined freely (e.g. `-ffv1 -h264` to generate a preservation master and an access copy in the same pass).
+Five output formats are available: `-h264`, `-v210`, `-prores`, `-ffv1`, `-desktop-review`. At least one must be specified on every invocation; they may be combined freely (e.g. `-ffv1 -h264` to generate a preservation master and an access copy in the same pass).
 
 ---
 
@@ -136,10 +136,16 @@ Uncompressed 10-bit 4:2:2 in a QuickTime container. **SD sources only** (see [In
 
 Color metadata is set per standard:
 
-| Standard | Field order | SAR | Primaries / matrix | Transfer |
-|----------|-------------|-----|--------------------|----------|
-| NTSC | BFF | 10:11 | `smpte170m` (BT.601 NTSC / BT.601) | BT.709 |
-| PAL | TFF | 12/11 | `bt470bg` (BT.601 PAL / BT.470 System B/G) | BT.709 |
+| Standard | Field order | SAR (vrecord default) | Primaries / matrix | Transfer |
+|----------|-------------|------------------------|--------------------|----------|
+| NTSC | BFF | 10:11 (0.909) | `smpte170m` (BT.601 NTSC / BT.601) | BT.709 |
+| PAL | TFF | 12:11 (1.091) | `bt470bg` (BT.601 PAL / BT.470 System B/G) | BT.709 |
+
+vdg targets [vrecord](https://github.com/amiaopensource/vrecord)'s own recommended SAR for each standard — the first/default value in vrecord's Config > Aspect Ratio tab — so v210 output matches what the lab's other SDI capture tooling already produces.
+
+**2026-09-28 fix:** a bug in `process_v210_output`'s filter chain (`setsar={value},setdar=4/3`) was silently overriding the intended `setsar` value — ffmpeg's `setdar` filter, applied after `setsar`, recalculates SAR to whatever produces an exact 4:3 DAR for the frame's actual coded dimensions, discarding the `setsar` value entirely. For 720×486 NTSC this produced 9:10 instead of the intended 10:11; for 720×576 PAL it would have produced 16:15 instead of 12:11. This is what an earlier version of this table (and of the MediaConch policy's `PixelAspectRatio` rule) mistakenly documented as vdg's "actual" output — it was the bug's symptom, not a legitimate target. **Fix:** `setdar=4/3` was removed from the filter chain; `setsar` alone now passes through untouched (confirmed via a real encode + `ffprobe`: `setsar=10/11` alone yields `sample_aspect_ratio=10:11`, `display_aspect_ratio=400:297` — SAR 10/11 and an *exact* 4:3 DAR are mathematically incompatible for a 720×486 frame, so the real DAR is 400:297, not a clean "4:3" fraction; players and MediaInfo may still round-display this as "4:3"). No `setdar` filter is used anywhere in `process_v210_output` as of this fix.
+
+**vrecord's other acceptable PAR values** (from vrecord's own Config > Aspect Ratio UI, which makes this setting user-configurable): NTSC 4:3 also accepts 8:9 (0.889), 9:10 (0.900), and 4320:4739 (0.912); PAL 4:3 also accepts 16:15 (1.067) and 128:117 (1.094). vdg's MediaConch policies (see [TN2162 Compliance](#tn2162-compliance) below) pass on any of these values for the corresponding standard, but vdg itself always *encodes* the default (10/11 / 12/11) — the wider acceptable set exists so a v210 file digitized elsewhere with a different vrecord PAR setting doesn't get falsely quarantined by vdg's validation. If a v210 output's PAR is acceptable but not vdg's own default, vdg logs a warning (not a failure) naming the mismatch.
 
 These match the tags vrecord writes on its NTSC and PAL captures. Before v1.5.0, PAL v210 output was tagged with NTSC primaries. The field order is fixed per standard, which is correct for SDI captures. PAL DV (bottom field first) and TFF NTSC sources would be mislabelled, but neither is sent to v210 in this lab's workflow (see the note on RF captures below).
 
@@ -177,6 +183,21 @@ Audio is copied without re-encoding, preserving the original stream exactly.
 Like v210, FFV1 output undergoes framemd5 + audio streamhash validation and, if `mediaconch` is available, a MediaConch policy check (unconditional — unlike v210, the FFV1 policy is not gated to a specific video standard). Failure deletes or retains (`--keep-failed`) the output and quarantines the source.
 
 Output filename: `<base>_pm.mkv`
+
+### Desktop Review (`-desktop-review`)
+
+A viewing copy for curators, artists, or writers who need something to show at a meeting, a public event, or a presentation — not a preservation or access derivative. Produces two files per source:
+
+| Output | Filename | Frame | Use |
+|--------|----------|-------|-----|
+| Desktop SD | `<base>_ds.mp4` | 720x540, square pixel, full-frame 4:3 | Computer/projector playback at native SD size |
+| Desktop HD | `<base>_dh.mp4` | 1920x1080, pillarboxed from a 4:3 source | HD displays/projectors expecting a 16:9 frame |
+
+Both are deinterlaced (`bwdif`) and scaled with high-quality Lanczos filtering, encoded H.264 High Profile at a higher bitrate than the `_sl` access copy (9 Mbps SD / 18 Mbps HD, vs. 1/2.8 Mbps for `_sl`) — these are meant to look good on a projector, not just stream cleanly. Field order/parity follows the same logic as `-h264`: explicit from `--force-scan` if passed, otherwise ffmpeg/bwdif's own per-frame detection. Output frame rate is fixed to the detected video standard (29.97p NTSC / 25p PAL), not derived from the source.
+
+**Requires an NTSC or PAL SD 4:3 source** (the same 720x486/480 NTSC and 720x576 PAL detection used elsewhere) — anamorphic 16:9 sources are not currently handled by this flag and will need letterbox-to-fit logic added if that comes up.
+
+Output filenames: `<base>_ds.mp4`, `<base>_dh.mp4`
 
 ---
 
@@ -335,6 +356,8 @@ Source files are expected to use a three-character role code suffix:
 | `_pm` | Preservation master |
 | `_sh` | Service high |
 | `_sl` | Service low |
+| `_ds` | Desktop review, SD |
+| `_dh` | Desktop review, HD |
 
 ### Output filename derivation
 
@@ -371,6 +394,7 @@ A warning is logged at the start of a run reporting how many unique IDs were aff
 | `-v210` | v210 uncompressed 10-bit 4:2:2 QuickTime (SD only) |
 | `-prores` | ProRes 422 HQ QuickTime (native resolution) |
 | `-ffv1` | FFV1 v3 lossless MKV (native resolution) |
+| `-desktop-review` | Desktop review SD + HD viewing copies (NTSC/PAL SD 4:3 sources only) |
 
 Exception: `--thumbs N` on its own, with no format flag, runs [thumbnails-only mode](#thumbnails-only).
 
@@ -577,12 +601,26 @@ If `mediaconch` is installed and in `PATH`, `vdg` runs an embedded policy check 
 | Format | Policy file | Scope | Checks |
 |--------|-------------|-------|--------|
 | FFV1 | `policy_ffv1.xml` | All video standards | Matroska container, FFV1 codec, GOP N=1 (intra), per-slice and container-level CRC error detection, audio is PCM or FLAC |
-| v210 | `policy_v210_ntsc.xml` | NTSC | MPEG-4/QuickTime container, v210 codec, 720×486 @ 29.970fps, 4:2:2, 10-bit, interlaced BFF, BT.601 NTSC primaries, BT.709 transfer, BT.601 matrix, PCM 24-bit 48kHz audio |
-| v210 | `policy_v210_pal.xml` | PAL | MPEG-4/QuickTime container, v210 codec, 720×576 @ 25.000fps, 4:2:2, 10-bit, interlaced TFF, BT.601 PAL primaries, BT.709 transfer, BT.470 System B/G matrix, PCM 24-bit 48kHz audio |
+| v210 | `policy_v210_ntsc.xml` | NTSC | MPEG-4/QuickTime container, v210 codec, 720×486 @ 29.970fps, 4:2:2, 10-bit, interlaced BFF, BT.601 NTSC primaries, BT.709 transfer, BT.601 matrix, pixel aspect ratio 0.909, 0.889, 0.900, or 0.912 (any vrecord-acceptable NTSC value — see [TN2162 Compliance](#tn2162-compliance)), PCM 24-bit 48kHz audio |
+| v210 | `policy_v210_pal.xml` | PAL | MPEG-4/QuickTime container, v210 codec, 720×576 @ 25.000fps, 4:2:2, 10-bit, interlaced TFF, BT.601 PAL primaries, BT.709 transfer, BT.470 System B/G matrix, pixel aspect ratio 1.091, 1.067, or 1.094 (any vrecord-acceptable PAL value — see [TN2162 Compliance](#tn2162-compliance)), PCM 24-bit 48kHz audio |
 
 For sources with no audio track, the audio rules are omitted. With `--clean-aperture`, the width and height rules are omitted.
 
 If `mediaconch` is not found, the check is skipped with a startup warning and treated as passing — it does not block otherwise-successful output. A policy failure after a passing framemd5 result still fails the job and quarantines the source. The policy XML is written to `process_logs/` for the duration of the check and deleted afterward unless `--keep-mediaconch` is passed.
+
+### TN2162 Compliance
+
+Apple Technical Note TN2162, "Uncompressed Y′CbCr Video in QuickTime Files," defines the required QuickTime structure for uncompressed Y′CbCr formats — this is `-v210`'s output specifically, not ProRes or H.264. Non-conformance with TN2162 has caused real interoperability problems in the AV preservation field historically, so the v210 MediaConch policies above assert it explicitly rather than only incidentally:
+
+| TN2162 component | What it requires | vdg's v210 policy check |
+|-------------------|-------------------|--------------------------|
+| `colr` atom | Color primaries / transfer function / matrix | `colour_primaries`, `transfer_characteristics`, `matrix_coefficients` rules |
+| `fiel` atom | Interlaced/progressive + field dominance | `ScanType`, `ScanOrder` rules |
+| ImageDescription v2 / codec | Correct FourCC, bit depth, chroma subsampling | `CodecID`, `BitDepth`, `ChromaSubsampling` rules |
+| `pasp` atom | Pixel aspect ratio | Nested `<policy type="or">` sub-policy (same pattern as `POLICY_FFV1`'s "Audio is PCM or FLAC" rule): **passes** on any [vrecord](https://github.com/amiaopensource/vrecord)-acceptable PAR for the standard (NTSC: 0.909/0.889/0.900/0.912; PAL: 1.091/1.067/1.094 — see the SAR table [above](#v210-quicktime--v210)), **fails** on anything else. vdg always encodes vrecord's own default (10/11 NTSC, 12/11 PAL); a separate Python-level warning (not a MediaConch rule, since MediaConch has no three-state result) fires when a v210 output's actual PAR is acceptable but not that default. |
+| `clap` atom | Clean aperture (display vs. coded dimensions) | **Not asserted.** vdg's default (`--clean-aperture` not passed) preserves the full coded frame — there's no display/coded mismatch for a `clap` atom to declare. `clap` conformance only becomes meaningful when `--clean-aperture` is used, and isn't currently checked even then. |
+
+**2026-09-28:** the `pasp` rule above was previously a single fixed value (0.900 NTSC / 1.067 PAL), asserted against what turned out to be a bug's output rather than vrecord's actual convention — see the SAR table correction [above](#v210-quicktime--v210) for the full root-cause writeup. Both the encoder's `setsar` target and this MediaConch rule have been corrected and confirmed against a real encode; both NTSC and PAL now use vrecord's documented value sets rather than a value derived only from NTSC's math.
 
 ### Command logging
 
@@ -843,6 +881,13 @@ The script checks for a minimum of 10 GB free in the output directory before pro
 ---
 
 ## Version History
+
+### v1.6.0 — September 2026
+- **`-desktop-review` output added:** produces `_ds` (720×540 square-pixel SD) and `_dh` (1920×1080 pillarboxed HD) viewing copies together, for curators/artists/writers to show at meetings or presentations — not a preservation or access derivative. NTSC/PAL SD 4:3 sources only (same gating as `-v210`). Deinterlaced via `bwdif`, higher bitrate than `-h264`'s `_sl` (9 Mbps SD / 18 Mbps HD). Reuses the `-h264` two-pass, separate-audio-mux structure from the v1.5.0 [#10](https://github.com/Stanford-Media-Preservation-Lab/vdg/issues/10) fix, so it doesn't reintroduce that audio-dropout bug.
+- **TN2162 compliance made explicit for `-v210`:** both NTSC and PAL MediaConch policies now cite Apple TN2162 ("Uncompressed Y′CbCr Video in QuickTime Files") directly and document which rules assert which TN2162 atom (`colr`, `fiel`, `pasp`) — see [TN2162 Compliance](#tn2162-compliance).
+- **v210 pixel aspect ratio bug fixed:** `process_v210_output`'s filter chain applied `setdar=4/3` after `setsar`, which silently recalculated and overrode the intended SAR — producing 9:10 (NTSC) instead of 10:11, and would have produced 16:15 (PAL) instead of 12:11. `setdar=4/3` has been removed; `setsar` now passes through untouched, confirmed against real NTSC and PAL captures on real ffmpeg@7 (`sample_aspect_ratio` now reads 10:11 / 12:11 as intended).
+- **PAR validation matches vrecord's own configurable values:** both v210 MediaConch policies' `PixelAspectRatio` rule is now a nested OR sub-policy that passes on any of [vrecord](https://github.com/amiaopensource/vrecord)'s user-configurable PAR values per standard (NTSC: 10/11 default, 8/9, 9/10, 4320/4739; PAL: 12/11 default, 16/15, 128/117), so a v210 master digitized elsewhere with a different vrecord PAR setting isn't falsely quarantined. vdg's own output always targets the vrecord default; a new warning (not a MediaConch failure) fires when an output's PAR is acceptable but doesn't match that default.
+- **`--help`/`--version` banner:** both now print the Stanford Media Preservation Lab name and version/date banner.
 
 ### v1.5.0 — September 2026
 - **H.264 audio dropout on long files fixed** ([#10](https://github.com/Stanford-Media-Preservation-Lab/vdg/issues/10)): video is encoded and audio muxed in separate ffmpeg processes. Verified on a 1:47:12 Premiere ProRes HQ export.
