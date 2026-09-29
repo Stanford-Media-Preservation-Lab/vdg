@@ -31,7 +31,7 @@ from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 SCRIPT_TITLE = "Stanford Media Preservation Lab"
-SCRIPT_NAME = "Video Derivative Generator, v1.6.0, September 2026"
+SCRIPT_NAME = "Video Derivative Generator, v1.7.0, September 2026"
 SCRIPT_SEPARATOR = "----"
 
 # Highest FFmpeg major version vdg has been validated against (lossless
