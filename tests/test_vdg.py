@@ -50,9 +50,14 @@ from vdg.cli import (
     V210_PAR_NTSC_ACCEPTABLE,
     V210_PAR_PAL_DEFAULT,
     V210_PAR_PAL_ACCEPTABLE,
+    parse_trim_timestamp,
+    probe_streams_summary,
+    validate_trim_output,
+    Config,
 )
 from unittest.mock import patch, MagicMock
 import types
+import argparse
 
 
 # ---------------------------------------------------------------------------
@@ -834,3 +839,196 @@ class TestParDefaultMismatch:
     def test_unknown_video_standard_returns_none(self):
         with patch('vdg.cli.subprocess.run', return_value=self._ffprobe_result('9:10')):
             assert par_default_mismatch(Path('out.mov'), VideoStandard.UNKNOWN) is None
+
+
+# ---------------------------------------------------------------------------
+# parse_trim_timestamp
+# ---------------------------------------------------------------------------
+
+class TestParseTrimTimestamp:
+    @pytest.mark.parametrize("value,expected", [
+        ("01:16:55", 4615.0),
+        ("76:55", 4615.0),          # MM:SS — leading unit isn't capped at 60
+        ("00:00:00", 0.0),
+        ("125", 125.0),
+        ("125.5", 125.5),
+        ("1:02:03.5", 3723.5),
+        ("0:00:01", 1.0),
+    ])
+    def test_valid_formats(self, value, expected):
+        assert parse_trim_timestamp(value) == pytest.approx(expected)
+
+    @pytest.mark.parametrize("value", [
+        "1:60:00",     # minutes out of range in HH:MM:SS
+        "00:00:60",    # seconds out of range
+        "abc",
+        "1:2:3:4",     # too many fields
+        "-5",
+        "",
+        "1:-5",        # negative seconds in MM:SS
+    ])
+    def test_invalid_formats_raise_value_error(self, value):
+        with pytest.raises(ValueError):
+            parse_trim_timestamp(value)
+
+
+# ---------------------------------------------------------------------------
+# Config: --trim-in/--trim-out standalone mode
+# ---------------------------------------------------------------------------
+
+def _trim_namespace(tmp_path, **overrides):
+    """Minimal argparse.Namespace covering every Config field, defaulting to a
+    valid trim-mode invocation. tmp_path/src and tmp_path/out are NOT created
+    here — tests create what they need."""
+    d = dict(
+        source_dir=str(tmp_path / "src"), output_dir=str(tmp_path / "out"), workers=1,
+        cleanup_only=False, move_finished=True, dry_run=True, skip_validation=False,
+        h264=False, v210=False, prores=False, ffv1=False, desktop_review=False,
+        audio_stream=0, audio_mode='stereo', audio_pan_center=False,
+        force_scan=None, force_fps=None, thumbs=None, clip_ceiling=None,
+        audio_channel=0, keep_framemd5=False, keep_mediaconch=False,
+        clean_aperture=False, force_anamorphic=False, keep_failed=False,
+        trim_in=None, trim_out=None,
+    )
+    d.update(overrides)
+    return argparse.Namespace(**d)
+
+
+class TestConfigTrimMode:
+    def test_trim_alone_is_valid_and_sets_trim_mode(self, tmp_path):
+        (tmp_path / "src").mkdir()
+        config = Config(_trim_namespace(tmp_path, trim_in="00:00:00", trim_out="01:16:55"))
+        assert config.trim_mode is True
+        assert config.thumbs_only is False
+        assert config.trim_in_seconds == pytest.approx(0.0)
+        assert config.trim_out_seconds == pytest.approx(4615.0)
+        # Trim mode never moves the source, same as thumbs_only.
+        assert config.move_finished is False
+
+    def test_trim_with_format_flag_raises(self, tmp_path):
+        (tmp_path / "src").mkdir()
+        with pytest.raises(ConfigError, match="standalone mode"):
+            Config(_trim_namespace(tmp_path, trim_in="00:00:00", trim_out="00:10:00", h264=True))
+
+    def test_trim_with_thumbs_raises(self, tmp_path):
+        (tmp_path / "src").mkdir()
+        with pytest.raises(ConfigError, match="standalone mode"):
+            Config(_trim_namespace(tmp_path, trim_in="00:00:00", trim_out="00:10:00", thumbs=4))
+
+    def test_trim_in_without_trim_out_raises(self, tmp_path):
+        (tmp_path / "src").mkdir()
+        with pytest.raises(ConfigError, match="must be given together"):
+            Config(_trim_namespace(tmp_path, trim_in="00:00:00"))
+
+    def test_trim_out_without_trim_in_raises(self, tmp_path):
+        (tmp_path / "src").mkdir()
+        with pytest.raises(ConfigError, match="must be given together"):
+            Config(_trim_namespace(tmp_path, trim_out="00:10:00"))
+
+    def test_trim_out_before_trim_in_raises(self, tmp_path):
+        (tmp_path / "src").mkdir()
+        with pytest.raises(ConfigError, match="must come after"):
+            Config(_trim_namespace(tmp_path, trim_in="01:00:00", trim_out="00:30:00"))
+
+    def test_malformed_trim_in_raises_config_error(self, tmp_path):
+        (tmp_path / "src").mkdir()
+        with pytest.raises(ConfigError, match="Invalid --trim-in"):
+            Config(_trim_namespace(tmp_path, trim_in="not-a-time", trim_out="00:10:00"))
+
+    def test_no_format_no_thumbs_no_trim_raises(self, tmp_path):
+        (tmp_path / "src").mkdir()
+        with pytest.raises(ConfigError, match="At least one output format"):
+            Config(_trim_namespace(tmp_path))
+
+    def test_trim_mode_does_not_create_finished_sources_dir(self, tmp_path):
+        (tmp_path / "src").mkdir()
+        Config(_trim_namespace(tmp_path, trim_in="00:00:00", trim_out="00:10:00"))
+        assert not (tmp_path / "src" / "finished_sources").exists()
+
+
+# ---------------------------------------------------------------------------
+# probe_streams_summary / validate_trim_output
+# ---------------------------------------------------------------------------
+
+class TestValidateTrimOutput:
+    """validate_trim_output()'s three tiers, with ffprobe/ffmpeg mocked out —
+    these don't need real media, just to prove the pass/fail logic and
+    messaging are correct given known probe/decode results."""
+
+    def _streams_result(self, streams):
+        result = MagicMock()
+        result.stdout = __import__('json').dumps({"streams": streams})
+        return result
+
+    def test_probe_streams_summary_extracts_type_and_codec(self):
+        streams = [
+            {"codec_type": "video", "codec_name": "ffv1"},
+            {"codec_type": "audio", "codec_name": "pcm_s24le"},
+            {"codec_type": "attachment", "codec_name": "text"},
+        ]
+        with patch('vdg.cli.subprocess.run', return_value=self._streams_result(streams)):
+            assert probe_streams_summary(Path("x.mkv")) == [
+                ("video", "ffv1"), ("audio", "pcm_s24le"), ("attachment", "text"),
+            ]
+
+    def test_all_tiers_pass(self):
+        streams = [("video", "ffv1"), ("audio", "pcm_s24le")]
+        streams_dicts = [{"codec_type": t, "codec_name": c} for t, c in streams]
+        decode_result = MagicMock(returncode=0, stderr="")
+
+        def fake_run(cmd, **kwargs):
+            if 'ffprobe' in cmd[0]:
+                return self._streams_result(streams_dicts)
+            return decode_result
+
+        with patch('vdg.cli.subprocess.run', side_effect=fake_run), \
+             patch('vdg.cli.get_video_info', return_value=types.SimpleNamespace(duration=10.0)):
+            ok, messages = validate_trim_output(Path("src.mkv"), Path("out.mkv"), 0.0, 10.0)
+        assert ok is True
+        assert any("Structural check passed" in m for m in messages)
+        assert any("Duration check passed" in m for m in messages)
+        assert any("Full decode validation passed" in m for m in messages)
+
+    def test_structural_mismatch_fails(self):
+        source_dicts = [{"codec_type": "video", "codec_name": "ffv1"}, {"codec_type": "audio", "codec_name": "pcm_s24le"}]
+        output_dicts = [{"codec_type": "video", "codec_name": "ffv1"}]  # dropped a stream
+        calls = {"n": 0}
+
+        def fake_run(cmd, **kwargs):
+            calls["n"] += 1
+            return self._streams_result(source_dicts if calls["n"] == 1 else output_dicts)
+
+        with patch('vdg.cli.subprocess.run', side_effect=fake_run), \
+             patch('vdg.cli.get_video_info', return_value=types.SimpleNamespace(duration=10.0)):
+            ok, messages = validate_trim_output(Path("src.mkv"), Path("out.mkv"), 0.0, 10.0)
+        assert ok is False
+        assert any("Structural check FAILED" in m for m in messages)
+
+    def test_duration_outside_tolerance_fails(self):
+        streams_dicts = [{"codec_type": "video", "codec_name": "ffv1"}]
+
+        def fake_run(cmd, **kwargs):
+            if 'ffprobe' in cmd[0]:
+                return self._streams_result(streams_dicts)
+            return MagicMock(returncode=0, stderr="")
+
+        with patch('vdg.cli.subprocess.run', side_effect=fake_run), \
+             patch('vdg.cli.get_video_info', return_value=types.SimpleNamespace(duration=50.0)):
+            # requested span 10s, actual output 50s — way outside the 15s tolerance
+            ok, messages = validate_trim_output(Path("src.mkv"), Path("out.mkv"), 0.0, 10.0)
+        assert ok is False
+        assert any("Duration check FAILED" in m for m in messages)
+
+    def test_decode_failure_fails(self):
+        streams_dicts = [{"codec_type": "video", "codec_name": "ffv1"}]
+
+        def fake_run(cmd, **kwargs):
+            if 'ffprobe' in cmd[0]:
+                return self._streams_result(streams_dicts)
+            return MagicMock(returncode=1, stderr="Error decoding stream")
+
+        with patch('vdg.cli.subprocess.run', side_effect=fake_run), \
+             patch('vdg.cli.get_video_info', return_value=types.SimpleNamespace(duration=10.0)):
+            ok, messages = validate_trim_output(Path("src.mkv"), Path("out.mkv"), 0.0, 10.0)
+        assert ok is False
+        assert any("Full decode validation FAILED" in m for m in messages)

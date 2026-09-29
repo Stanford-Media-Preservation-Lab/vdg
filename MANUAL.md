@@ -21,10 +21,11 @@
 12. [Audio Configuration](#audio-configuration)
 13. [Override Flags](#override-flags)
 14. [Thumbnails](#thumbnails)
-15. [Validation and Logging](#validation-and-logging)
-16. [Usage Examples](#usage-examples)
-17. [Troubleshooting](#troubleshooting)
-18. [Version History](#version-history)
+15. [Trimming an Over-Run Capture](#trimming-an-over-run-capture)
+16. [Validation and Logging](#validation-and-logging)
+17. [Usage Examples](#usage-examples)
+18. [Troubleshooting](#troubleshooting)
+19. [Version History](#version-history)
 
 ---
 
@@ -396,7 +397,7 @@ A warning is logged at the start of a run reporting how many unique IDs were aff
 | `-ffv1` | FFV1 v3 lossless MKV (native resolution) |
 | `-desktop-review` | Desktop review SD + HD viewing copies (NTSC/PAL SD 4:3 sources only) |
 
-Exception: `--thumbs N` on its own, with no format flag, runs [thumbnails-only mode](#thumbnails-only).
+Exception: `--thumbs N` on its own, with no format flag, runs [thumbnails-only mode](#thumbnails-only). `--trim-in`/`--trim-out` on their own, with no format flag, run [trim mode](#trimming-an-over-run-capture).
 
 ### General flags
 
@@ -570,6 +571,53 @@ vdg --source-dir /Volumes/disk/1/source/finished_sources --output-dir /Volumes/d
 - `--thumbs` must be at least 1 in this mode.
 
 If H.264 encoding fails, all thumbnails for that file are deleted as part of cleanup.
+
+---
+
+## Trimming an Over-Run Capture
+
+`--trim-in TIMESTAMP --trim-out TIMESTAMP`, with **no** format flag, is a third standalone mode alongside [thumbnails-only](#thumbnails-only): a lossless stream-copy trim of a single capture, for recovering a digitization session that ran long — for example, a VHS deck left running past the end of a 90-minute program because the operator was pulled into a meeting, leaving 30 minutes of trailing snow or black on the file.
+
+```bash
+vdg --source-dir /Volumes/disk/1/source --output-dir /Volumes/disk/1/output --trim-in 00:00:00 --trim-out 01:16:55
+```
+
+- **Exactly one video file** must be in `--source-dir` (excluding `finished_sources`). vdg refuses to guess which file you mean if there's more than one, and errors if there's none.
+- Timestamps accept `HH:MM:SS[.mmm]`, `MM:SS[.mmm]`, or plain seconds (`4615` or `4615.5`).
+- The output is `<original stem>_trimmed<original extension>` in `--output-dir` — e.g. `abc123def45_pm.mkv` → `abc123def45_pm_trimmed.mkv`. **The source file is never moved or modified.**
+- Every stream is copied — video, every audio track, and (for Matroska) any attachments, such as the `_capture_options.log`/`_vrecord_input.log` vrecord embeds — via `-map 0 -c copy`. Nothing is re-encoded.
+- `--dry-run`, `--skip-validation`, and `--keep-failed` all apply, the same as the rest of vdg.
+
+### The keyframe-boundary caveat
+
+Because nothing is re-encoded, ffmpeg can only start or stop the copied stream at a keyframe — it cannot cut mid-GOP without decoding and re-encoding, which would defeat the point of a lossless trim. vdg uses **input-side seeking** (`-ss`/`-to` placed before `-i`), which snaps automatically to the nearest keyframe rather than failing outright the way some GUI tools (e.g. LosslessCut) do when asked to cut at a non-keyframe point.
+
+The practical effect: the actual cut point can land a few seconds from what you asked for — up to one GOP length, which for a typical H.264 export or capture is usually a couple of seconds. For trimming dead air/snow off the tail of a capture, that's harmless. It matters if you need a frame-accurate cut, which this feature does not provide for non-intra codecs.
+
+**FFV1 preservation masters (`_pm`) are unaffected by this** — FFV1 as vdg encodes it is all-intra (GOP=1, every frame a keyframe), so the trim lands exactly on the requested timestamps.
+
+Either way, the actual output duration vs. the requested span is checked and logged (see below), so any keyframe-snap drift is visible rather than silently hidden.
+
+### Verification
+
+After the trim, vdg checks and logs three things before calling the output ready for review:
+
+1. **Structural** — every stream present in the source (video, all audio tracks, attachments) is still present in the output, in the same order, with the same codec.
+2. **Duration** — the output's duration is compared against the requested span, with a generous tolerance for keyframe-boundary snapping (see above). The actual drift is always logged, pass or fail.
+3. **Full decode** — every stream (`-map 0`, not just ffmpeg's default-selected streams) is decoded start to finish and checked for a clean, error-free result.
+
+If any check fails, the output is deleted (or retained with a `_VALIDATION_FAILED` suffix if `--keep-failed` is passed) and vdg exits non-zero. The source file is untouched either way.
+
+### Manual review — this step is not automated
+
+Trim mode does **not** rename the output over the original or delete the original — that decision is yours. After a successful, validated trim:
+
+1. Watch the `*_trimmed` file yourself to confirm it looks and sounds right.
+2. Rename it over the original (dropping `_trimmed` from the filename).
+3. Delete the original.
+4. Proceed with the rest of the workflow as normal.
+
+This is a deliberate tradeoff: vdg's automated checks confirm the file is structurally complete and decodes cleanly, but only a human watching the file can confirm the *content* is right — that the trim point didn't land somewhere that cuts off wanted material.
 
 ---
 
@@ -903,6 +951,9 @@ The script checks for a minimum of 10 GB free in the output directory before pro
 ---
 
 ## Version History
+
+### Unreleased
+- **`--trim-in`/`--trim-out` added:** a standalone lossless stream-copy trim of a single over-run capture (e.g. trailing snow/black after a digitization session ran long), alongside thumbnails-only mode. See [Trimming an Over-Run Capture](#trimming-an-over-run-capture).
 
 ### v1.6.0 — September 2026
 - **`-desktop-review` output added:** produces `_ds` (720×540 square-pixel SD) and `_dh` (1920×1080 pillarboxed HD) viewing copies together, for curators/artists/writers to show at meetings or presentations — not a preservation or access derivative. NTSC/PAL SD 4:3 sources only (same gating as `-v210`). Deinterlaced via `bwdif`, higher bitrate than `-h264`'s `_sl` (9 Mbps SD / 18 Mbps HD). Reuses the `-h264` two-pass, separate-audio-mux structure from the v1.5.0 [#10](https://github.com/Stanford-Media-Preservation-Lab/vdg/issues/10) fix, so it doesn't reintroduce that audio-dropout bug.

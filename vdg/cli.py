@@ -322,19 +322,51 @@ class Config:
         # CSV, since the source has normally already been processed.
         any_format = (self.output_h264 or self.output_v210 or self.output_prores or self.output_ffv1
                       or self.output_desktop_review)
-        self.thumbs_only = not any_format and self.thumb_count is not None
-        if not any_format and not self.thumbs_only:
+
+        # Trim mode: --trim-in/--trim-out with no format flag and no --thumbs is
+        # a third standalone mode, alongside thumbs_only — a lossless stream-copy
+        # trim of a single over-run capture (see run_trim()). Like thumbs_only,
+        # the source is left in place and nothing is recorded in the resume CSV.
+        self.trim_in_str = args.trim_in
+        self.trim_out_str = args.trim_out
+        self.trim_in_seconds: Optional[float] = None
+        self.trim_out_seconds: Optional[float] = None
+        trim_requested = (self.trim_in_str is not None) or (self.trim_out_str is not None)
+        if trim_requested:
+            if self.trim_in_str is None or self.trim_out_str is None:
+                raise ConfigError("--trim-in and --trim-out must be given together")
+            if any_format or self.thumb_count is not None:
+                raise ConfigError("--trim-in/--trim-out is a standalone mode and cannot be combined with an "
+                                  "output format flag (-h264/-v210/-prores/-ffv1/-desktop-review) or --thumbs")
+            try:
+                self.trim_in_seconds = parse_trim_timestamp(self.trim_in_str)
+            except ValueError as e:
+                raise ConfigError(f"Invalid --trim-in value: {e}")
+            try:
+                self.trim_out_seconds = parse_trim_timestamp(self.trim_out_str)
+            except ValueError as e:
+                raise ConfigError(f"Invalid --trim-out value: {e}")
+            if self.trim_out_seconds <= self.trim_in_seconds:
+                raise ConfigError(f"--trim-out ({self.trim_out_str}) must come after --trim-in ({self.trim_in_str})")
+        self.trim_mode = trim_requested
+
+        self.thumbs_only = not any_format and not trim_requested and self.thumb_count is not None
+        if not any_format and not self.thumbs_only and not trim_requested:
             raise ConfigError("At least one output format must be specified (-h264, -v210, -prores, -ffv1, "
-                              "or -desktop-review), or --thumbs N on its own to generate thumbnails only")
+                              "or -desktop-review), --thumbs N on its own to generate thumbnails only, or "
+                              "--trim-in/--trim-out on its own to trim one file")
         if self.thumbs_only:
             if self.thumb_count < 1:
                 raise ConfigError("--thumbs must be at least 1 when generating thumbnails only")
             self.move_finished = False
+        if self.trim_mode:
+            self.move_finished = False
         self.setup_notices = validate_directories(self.source_dir, self.output_dir)
         directories = [self.output_dir, self.log_dir, self.quarantine_dir]
-        if not self.thumbs_only:
-            # Thumbnail-only runs are often pointed at an existing finished_sources
-            # folder — don't create a nested finished_sources inside it.
+        if not self.thumbs_only and not self.trim_mode:
+            # Thumbnail-only and trim runs are often pointed at an existing
+            # finished_sources folder — don't create a nested finished_sources
+            # inside it, and neither mode moves sources there anyway.
             directories.append(self.finished_dir)
         for directory in directories:
             try:
@@ -670,6 +702,33 @@ def format_duration(seconds: float) -> str:
     secs = int(seconds % 60)
     return f"{hours:02d}:{minutes:02d}:{secs:02d}" if hours > 0 else f"{minutes:02d}:{secs:02d}"
 
+def parse_trim_timestamp(value: str) -> float:
+    """Parse a --trim-in/--trim-out value: HH:MM:SS[.ms], MM:SS[.ms], or plain
+    seconds ('125' or '125.5'). Raises ValueError on anything else."""
+    value = value.strip()
+    if re.fullmatch(r'\d+(\.\d+)?', value):
+        return float(value)
+    fields = value.split(':')
+    if len(fields) not in (2, 3):
+        raise ValueError(f"unrecognized timestamp {value!r} (expected HH:MM:SS, MM:SS, or plain seconds)")
+    try:
+        fields = [float(f) for f in fields]
+    except ValueError:
+        raise ValueError(f"unrecognized timestamp {value!r} (expected HH:MM:SS, MM:SS, or plain seconds)")
+    if len(fields) == 2:
+        # MM:SS — minutes is the leading unit here, so it isn't capped at 60
+        # (e.g. '76:55' meaning 76 minutes, 55 seconds is fine); only seconds is.
+        hours, minutes, seconds = 0.0, fields[0], fields[1]
+        if minutes < 0 or not (0 <= seconds < 60):
+            raise ValueError(f"timestamp component out of range: {value!r}")
+    else:
+        # HH:MM:SS — minutes and seconds are both capped at 60 here, since hours
+        # is the leading unit.
+        hours, minutes, seconds = fields
+        if hours < 0 or not (0 <= minutes < 60) or not (0 <= seconds < 60):
+            raise ValueError(f"timestamp component out of range: {value!r}")
+    return hours * 3600 + minutes * 60 + seconds
+
 def get_file_info_for_display(file_path: Path) -> Tuple[int, float]:
     try:
         size = file_path.stat().st_size
@@ -978,6 +1037,81 @@ def validate_output(file_path: Path, timeout: int = VALIDATION_TIMEOUT) -> Tuple
         return False, "Validation timeout"
     except Exception as e:
         return False, str(e)
+
+def probe_streams_summary(file_path: Path, timeout: int = 30) -> List[Tuple[str, str]]:
+    """(codec_type, codec_name) for every stream in the file, in stream order —
+    including non-AV streams like Matroska attachments (ffprobe reports these
+    as codec_type='attachment'). Used to check that --trim-in/--trim-out's
+    stream-copy-everything ('-map 0 -c copy') actually carried every stream
+    through, not just audio/video."""
+    cmd = ['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type,codec_name', '-of', 'json', str(file_path)]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    data = json.loads(result.stdout)
+    return [(s.get('codec_type', '?'), s.get('codec_name', '?')) for s in data.get('streams', [])]
+
+def validate_trim_output(source_path: Path, output_path: Path, requested_in: float, requested_out: float,
+                          timeout: int = VALIDATION_TIMEOUT) -> Tuple[bool, List[str]]:
+    """Three-tier check for a --trim-in/--trim-out stream-copy output:
+      1. Structural — every stream in the source (video/audio/attachments/data)
+         is present in the output, same codec, same order.
+      2. Duration — output duration is within tolerance of the requested span.
+         Stream-copy trims can only cut at keyframes (ffmpeg can't split mid-GOP
+         without re-encoding), so for non-intra codecs the actual cut point may
+         land a GOP away from what was requested — expected, not a failure, as
+         long as it's within tolerance. FFV1 masters (GOP=1, all-intra) land
+         exactly on the requested point.
+      3. Full decode — every stream, via '-map 0' (not ffmpeg's default picks),
+         decodes cleanly start to finish.
+    Returns (ok, messages); messages covers all three tiers regardless of
+    overall pass/fail, so the caller can log full detail either way.
+    """
+    messages: List[str] = []
+    ok = True
+
+    try:
+        source_streams = probe_streams_summary(source_path)
+        output_streams = probe_streams_summary(output_path)
+    except Exception as e:
+        return False, [f"Structural check FAILED: could not probe streams: {e}"]
+    if source_streams != output_streams:
+        ok = False
+        messages.append(f"Structural check FAILED: source streams {source_streams} != output streams {output_streams}")
+    else:
+        messages.append(f"Structural check passed: {len(output_streams)} stream(s) match source {output_streams}")
+
+    try:
+        output_duration = get_video_info(output_path).duration
+    except Exception as e:
+        ok = False
+        messages.append(f"Duration check FAILED: could not read output duration: {e}")
+    else:
+        requested_duration = requested_out - requested_in
+        drift = output_duration - requested_duration
+        tolerance = 15.0  # seconds — generous, to allow for a keyframe-boundary snap
+        if abs(drift) > tolerance:
+            ok = False
+            messages.append(f"Duration check FAILED: output is {format_duration(output_duration)}, requested span "
+                            f"was {format_duration(requested_duration)} (drift {drift:+.1f}s, tolerance {tolerance:.0f}s)")
+        else:
+            messages.append(f"Duration check passed: output is {format_duration(output_duration)}, requested span "
+                            f"was {format_duration(requested_duration)} (drift {drift:+.1f}s — expected if a trim "
+                            f"point fell mid-GOP and ffmpeg snapped to the nearest keyframe)")
+
+    cmd = ['ffmpeg', '-v', 'error', '-i', str(output_path), '-map', '0', '-f', 'null', '-']
+    result = None
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        decode_ok = result.returncode == 0 and len(result.stderr) == 0
+    except subprocess.TimeoutExpired:
+        decode_ok = False
+    if not decode_ok:
+        ok = False
+        err = result.stderr.strip()[:500] if result is not None else "Validation timeout"
+        messages.append(f"Full decode validation FAILED (-map 0, every stream): {err}")
+    else:
+        messages.append("Full decode validation passed: all streams (-map 0) decoded cleanly start to finish")
+
+    return ok, messages
 
 # v210 PAL policy — mirrors POLICY_V210_NTSC for 625-line/25 fps SD. SDI PAL is
 # top field first; primaries and matrix tagged bt470bg, which MediaInfo reports as
@@ -2366,6 +2500,14 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument('--thumbs', type=int, default=None,
                         help='Number of thumbnails to generate (default: 4 at standard positions, override uses random positions). '
                              'Pass --thumbs N with no format flag to generate thumbnails only (no video derivative).')
+    parser.add_argument('--trim-in', type=str, default=None, metavar='TIMESTAMP',
+                        help='Start point for --trim-out mode (HH:MM:SS[.ms] or seconds). Requires --trim-out and '
+                             'no format flag: a standalone stream-copy trim of exactly one source file in '
+                             '--source-dir, for recovering a digitization session that ran long (e.g. trailing '
+                             'snow/black). Writes <stem>_trimmed<ext> to --output-dir; the source is never moved '
+                             'or modified.')
+    parser.add_argument('--trim-out', type=str, default=None, metavar='TIMESTAMP',
+                        help='End point for --trim-in mode (HH:MM:SS[.ms] or seconds). See --trim-in.')
     parser.add_argument('-h264', action='store_true', help='Generate H.264 MP4 output with thumbnails (_sl.mp4)')
     parser.add_argument('-v210', action='store_true', help='Generate v210 uncompressed 10-bit 4:2:2 QuickTime output (.mov)')
     parser.add_argument('-prores', action='store_true', help='Generate ProRes 422 HQ QuickTime output (_sh.mov)')
@@ -2388,6 +2530,100 @@ def parse_arguments() -> argparse.Namespace:
                                   'Default: disabled.')
     return parser.parse_args()
 
+def run_trim(config: Config, logger: logging.Logger) -> int:
+    """Standalone --trim-in/--trim-out mode: a lossless stream-copy trim of the
+    single file in --source-dir, for recovering a digitization session that ran
+    long (e.g. trailing snow/black after the operator was pulled away). The
+    source is never moved or modified — the user reviews the *_trimmed output
+    and manually replaces the original once satisfied (see MANUAL.md)."""
+    files = collect_video_files(config.source_dir, config.finished_dir)
+    if len(files) == 0:
+        raise ConfigError(f"--trim-in/--trim-out requires exactly one video file in {config.source_dir}, found none")
+    if len(files) > 1:
+        names = ', '.join(f.name for f in files[:10])
+        more = '...' if len(files) > 10 else ''
+        raise ConfigError(f"--trim-in/--trim-out requires exactly one video file in {config.source_dir}, "
+                          f"found {len(files)}: {names}{more}")
+    source_path = files[0]
+    output_path = config.output_dir / f"{source_path.stem}_trimmed{source_path.suffix}"
+
+    logger.info(f"Trim mode: {source_path.name} [{config.trim_in_str} -> {config.trim_out_str}] -> {output_path.name}")
+
+    # Input-side -ss/-to (before -i): with stream copy, ffmpeg's demuxer snaps
+    # these to the nearest keyframe rather than erroring out on a non-keyframe
+    # start point (unlike output-side seeking, which some tools — and even
+    # ffmpeg itself in some configurations — can refuse for the same reason).
+    # -avoid_negative_ts make_zero rewrites timestamps so the trimmed file
+    # starts clean at 0 rather than carrying the original file's offset.
+    cmd = ['ffmpeg', '-ss', config.trim_in_str, '-to', config.trim_out_str, '-i', str(source_path),
+           '-map', '0', '-c', 'copy', '-avoid_negative_ts', 'make_zero', str(output_path)]
+
+    if config.dry_run:
+        print(f"\n[DRY RUN] Would trim {source_path.name} -> {output_path.name}")
+        print(f"[DRY RUN] Command: {shlex.join(cmd)}\n")
+        logger.info(f"[DRY RUN] Trim command: {shlex.join(cmd)}")
+        return 0
+
+    process_log = config.log_dir / f"{source_path.stem}_trim.log"
+    try:
+        with open(process_log, 'w') as log_f:
+            log_f.write(f"vdg trim -- {datetime.now().isoformat()}\n"
+                        f"Source: {source_path}\nOutput: {output_path}\n"
+                        f"Requested: {config.trim_in_str} -> {config.trim_out_str}\n\n")
+    except Exception as e:
+        logger.warning(f"Failed to initialize trim process log: {e}")
+
+    try:
+        source_fps = get_video_info(source_path).fps
+    except Exception:
+        source_fps = 30.0
+    estimated_frames = max(int((config.trim_out_seconds - config.trim_in_seconds) * source_fps), 1)
+
+    success, _ = run_ffmpeg_with_progress(cmd, estimated_frames, f"Trim: {source_path.name[:30]}", process_log)
+    if not success:
+        print(f"\n{Colors.RED}{Colors.BOLD}TRIM FAILED:{Colors.RESET} ffmpeg exited with an error -- see {process_log}\n")
+        logger.error(f"Trim failed for {source_path.name} -- ffmpeg exited with an error, see {process_log}")
+        if output_path.exists() and not config.keep_failed:
+            output_path.unlink()
+        return 1
+
+    if config.skip_validation:
+        logger.warning(f"Trim complete for {source_path.name} -- validation skipped (--skip-validation)")
+        print(f"\n{Colors.YELLOW}Trim complete (validation skipped):{Colors.RESET} {output_path}\n"
+             f"Review the file yourself, then manually rename it over the original and delete the original -- "
+             f"vdg does not do this automatically.\n")
+        return 0
+
+    print("\nValidating trim output...")
+    ok, messages = validate_trim_output(source_path, output_path, config.trim_in_seconds, config.trim_out_seconds)
+    try:
+        with open(process_log, 'a') as log_f:
+            log_f.write("\nVALIDATION:\n" + "\n".join(messages) + "\n")
+    except Exception as e:
+        logger.warning(f"Failed to append validation results to trim log: {e}")
+    for m in messages:
+        logger.info(m)
+
+    if not ok:
+        print(f"\n{Colors.RED}{Colors.BOLD}TRIM VALIDATION FAILED{Colors.RESET} -- see {process_log}:")
+        for m in messages:
+            print(f"  - {m}")
+        handle_failed_lossless_output(output_path, config.keep_failed)
+        if config.keep_failed:
+            print(f"\nOutput retained with a _VALIDATION_FAILED suffix for inspection (--keep-failed).\n")
+        else:
+            print(f"\nOutput deleted. Source file was never modified: {source_path}\n")
+        return 1
+
+    print(f"\n{Colors.GREEN}{Colors.BOLD}Trim complete and validated:{Colors.RESET} {output_path}")
+    for m in messages:
+        print(f"  - {m}")
+    print(f"\n{Colors.BOLD}Manual review required{Colors.RESET} -- this is not automatic. Watch the trimmed file, "
+         f"then rename it over the original and delete the original yourself once you're satisfied. The source "
+         f"file was not moved or modified: {source_path}\n")
+    logger.info(f"Trim complete and validated: {output_path}")
+    return 0
+
 def main():
     args = parse_arguments()
     print(f"\n{Colors.BOLD}{Colors.CYAN}{SCRIPT_TITLE}{Colors.RESET}")
@@ -2405,6 +2641,11 @@ def main():
         if not config.dry_run:
             check_disk_space(config.output_dir)
         logger.info("Starting video transcoding pipeline")
+        if config.trim_mode:
+            logger.info(f"Trim mode: {config.trim_in_str} -> {config.trim_out_str} — stream-copy trim of a single "
+                        f"file, source left in place, not recorded in the resume CSV")
+            exit_code = run_trim(config, logger)
+            sys.exit(exit_code)
         if config.thumbs_only:
             logger.info(f"Thumbnail-only mode: {config.thumb_count} thumbnail(s) per file at random positions — "
                         f"no video derivatives, sources left in place, not recorded in the resume CSV")
