@@ -144,33 +144,39 @@ vdg --version
 
 Development happens only on the lab's laptop (steps 1–7 above, with a local clone in editable mode). Every other lab workstation is a "worker bee" — it runs vdg via `pipx`, straight from the GitHub repo, with no local clone needed. Steps 1–4 above (FFmpeg, MediaInfo, Python) still apply; skip straight to this section instead of cloning the repo.
 
-### Install
+**Worker-bee installs are pinned to a release tag**, not to `main`. This means a workstation only ever runs a tagged, released version — never whatever happens to be sitting on `main` mid-development — and an upgrade is always a deliberate, explicit step naming the new tag.
+
+### Install (pin to the current release)
 
 ```bash
-pipx install git+https://github.com/Stanford-Media-Preservation-Lab/vdg.git
+pipx install git+https://github.com/Stanford-Media-Preservation-Lab/vdg.git@v1.6.0
 ```
 
-### Upgrade to the latest release
+Always include the `@vX.Y.Z` tag. Check the [repo's releases/tags](https://github.com/Stanford-Media-Preservation-Lab/vdg/tags) for the current version if you're not sure it's still `v1.6.0`.
+
+### Upgrade to a new release
+
+**`pipx upgrade vdg` will not work for a tag-pinned install** — pip treats a pinned git ref as already satisfied and pipx will report "vdg is unchanged" without checking anything, even when a newer tag exists. Every upgrade is a forced reinstall naming the new tag explicitly:
 
 ```bash
-pipx upgrade vdg
+pipx install --force git+https://github.com/Stanford-Media-Preservation-Lab/vdg.git@v1.6.0
 ```
 
-Since the install has no pinned tag or branch, `pipx upgrade` re-fetches and picks up whatever is currently on `main` — this is how a worker-bee machine gets a new release without ever touching git directly.
+Replace `v1.6.0` with whatever the new release tag actually is.
 
-### ⚠️ Never run a bare `pipx install vdg` (no URL)
+### ⚠️ Never install or upgrade by bare package name alone
 
-**There is an unrelated package on PyPI also named `vdg`** (a VCB-Studio anime-release tool — nothing to do with this lab). `pipx install vdg` without the `git+https://...` URL resolves against PyPI by default and will silently install *that* package instead, with a completely different, unrecognizable set of command-line flags and no `--version` output in the expected format. This is exactly what happens after a `pipx uninstall vdg` — pipx forgets the original git source, so a plain re-`install` falls through to PyPI.
+**There is an unrelated package on PyPI also named `vdg`** (a VCB-Studio anime-release tool — nothing to do with this lab). Any pipx command that omits the full `git+https://...@vX.Y.Z` spec — a bare `pipx install vdg`, or the bare `pipx install --force vdg` that `pipx upgrade` itself will suggest when it can't upgrade a pinned install — resolves against PyPI instead and silently installs *that* package, with a completely different, unrecognizable set of command-line flags and no `--version` output in the expected format. This is especially easy to hit right after a `pipx uninstall vdg`, since pipx forgets the original git source at that point.
 
 **If this happens to you:**
 
 ```bash
 pipx uninstall vdg
-pipx install git+https://github.com/Stanford-Media-Preservation-Lab/vdg.git
+pipx install git+https://github.com/Stanford-Media-Preservation-Lab/vdg.git@v1.6.0
 vdg --version
 ```
 
-**Rule of thumb:** `pipx upgrade vdg` is always safe (it reuses the already-recorded git source). `pipx install vdg` is only ever safe with the full `git+https://...` URL attached — never the bare package name.
+**Rule of thumb:** every `pipx install`/`pipx install --force` for vdg must include the full `git+https://github.com/Stanford-Media-Preservation-Lab/vdg.git@vX.Y.Z` spec, tag included — there is no safe bare-name form of this command, for either a fresh install or an upgrade.
 
 ### Per-machine default paths
 
