@@ -30,11 +30,11 @@
 
 ## Overview
 
-`vdg` (Video Derivative Generator) is a batch video transcoding tool for the Stanford Media Preservation Lab. It processes video files from a source directory, generates one or more derivative formats, produces JPEG 2000 thumbnails alongside H.264 output, and moves completed source files to a finished archive folder. Sources that are detected as variable frame rate before encoding, or whose lossless output fails validation, are moved to a `QUARANTINE` folder instead of the finished archive, so review candidates never get silently mixed back in with untried or successfully-processed sources. All operations are logged to a per-file process log and a cumulative CSV summary.
+`vdg` (Video Derivative Generator) is a batch video transcoding tool for the Stanford Media Preservation Lab. It processes video files from a source directory, generates one or more derivative formats, produces JPEG 2000 thumbnails alongside H.264 output, and moves completed source files to a finished archive folder. Preservation source files (digitized from tape) that are detected as variable frame rate before encoding, or whose lossless output fails validation, are moved to a `QUARANTINE` folder instead of the finished archive, so review candidates never get silently mixed back in with untried or successfully-processed sources. All operations are logged to a per-file process log and a cumulative CSV summary.
 
 The script is designed around two distinct intake pipelines:
 
-- **Tape digitization** — FFV1/MKV preservation masters produced by the SMPL digitization workflow from analog formats (e.g., Betacam SP, Digital Betacam, VHS, U-matic, Hi8, DV, etc.)
+- **Tape digitization** — FFV1/MKV preservation masters produced by the SMPL digitization workflow from analog formats (e.g., Betacam SP, Digital Betacam, VHS, U-matic, 1/2" EIAJ, Hi8, DV, etc.)
 - **Acquired digital content** — Deliverables from vendors and distributors, which could be digitzed from tape by some other service, or have no known provenance, or may be born-digital camera files or produced content for distribution.
 
 Five output formats are available: `-h264`, `-v210`, `-prores`, `-ffv1`, `-desktop-review`. At least one must be specified on every invocation; they may be combined freely (e.g. `-ffv1 -h264` to generate a preservation master and an access copy in the same pass).
@@ -89,7 +89,7 @@ Check which FFmpeg `vdg` will use with `which ffmpeg && ffmpeg -version | head -
 
 Source files are FFV1-encoded MKV containers produced by the SMPL tape digitization workflow. These files follow a strict naming convention using the `_pm` role code suffix. The script is well-tested against this population.
 
-Supported source formats: Betacam SP, Digital Betacam, VHS, U-matic, Hi8, DV
+Supported source formats digitized from tape include Betacam SP, Digital Betacam, VHS, Betamax, U-matic, 8mm/Hi8/D8, 1/2" EIAJ, MiniDV/DVCAM/DVCPro/DVCProHD, and LaserDisc (RF capture/decode workflow).
 
 **DV note:** DV content is captured and packaged using dvrescue (MIPoPS). dvrescue-packaged DV-in-MKV files can present unreliable container metadata — in particular, ffprobe may misread the frame rate. The frame rate is now corrected automatically from the DV frame header (see [DV frame rate correction](#dv-frame-rate-correction)); `--force-fps 29.97` remains available as an override. DV sources usually have no stream-level field order either, but `vdg` now falls back to the field order in the first frames (see [`--force-scan`](#--force-scan)). Keeping `--force-scan bff` on DV runs is still a harmless safeguard.
 
@@ -97,7 +97,7 @@ Supported source formats: Betacam SP, Digital Betacam, VHS, U-matic, Hi8, DV
 
 ### Acquired Digital Content (HD)
 
-Born-digital deliverables from vendors, distributors, and licensing partners. These files may arrive as H.264 or H.265 in `.mov` or `.mp4` containers, or occasionally as other formats. This population is more variable in its technical attributes. The `-h264` output flag is the appropriate derivative for this pipeline; `-ffv1` is also commonly used here to produce a lossless preservation copy of an HD deliverable.
+Born-digital deliverables from vendors, distributors, and licensing partners. These files may arrive as various types of video, including H.264 or H.265 in `.mov` or `.mp4` containers, and sometimes, more obscure or antiquated formats. This population is much more variable in its technical attributes. The `-h264` output flag is the appropriate derivative for this pipeline; `-ffv1` is also commonly used here to produce a lossless preservation copy of a video utilising a legacy or discouraged-for-long-term-preservation video or audio codec.
 
 ---
 
@@ -126,7 +126,7 @@ Audio: AAC stereo, 48 kHz, 128 kbps. See [Audio Configuration](#audio-configurat
 2. **Pass 2**: x264 final encode, video only, written to `process_logs/<base>_sl_video_tmp.mp4`.
 3. **Audio mux**: the pass-2 video is stream-copied (not re-encoded) into the final MP4, and the audio is decoded, filtered and AAC-encoded from the source.
 
-Keeping video encoding and audio encoding in separate ffmpeg processes is the fix for audio dropping out partway through long files, observed around 35 minutes into long Premiere ProRes HQ exports ([issue #10](https://github.com/Stanford-Media-Preservation-Lab/vdg/issues/10)). When slow x264 video and near-instant AAC audio were encoded in one process, the audio went silent while the video kept playing and the file duration still looked correct. The mux step also passes `aresample=async=1:min_hard_comp=0.1:first_pts=0` (ahead of any `--audio-mode`/`--clip-ceiling` filters) and `-max_interleave_delta 0`. Neither fixed the dropout on its own. They're kept because they're part of the command confirmed on a real 1:47:12 Premiere export. The split applies to every `-h264` source with audio: the mux step only reads the file and decodes audio, so it adds little time. The temp video is deleted after a successful mux. If pass 2 or the mux fails, it's left in `process_logs/` for inspection. Sources with no audio skip the mux step: pass 2 writes the final file directly.
+Keeping video encoding and audio encoding in separate ffmpeg processes is the fix for audio dropping out partway through long files, observed on Premiere ProRes HQ exports in the 90-minute-to-2-hour range ([issue #10](https://github.com/Stanford-Media-Preservation-Lab/vdg/issues/10)). When slow x264 video and near-instant AAC audio were encoded in one process, the audio went silent while the video kept playing and the file duration still looked correct. The mux step also passes `aresample=async=1:min_hard_comp=0.1:first_pts=0` (ahead of any `--audio-mode`/`--clip-ceiling` filters) and `-max_interleave_delta 0`. Neither fixed the dropout on its own. They're kept because they're part of the command confirmed against a real export in that length range. The split applies to every `-h264` source with audio: the mux step only reads the file and decodes audio, so it adds little time. The temp video is deleted after a successful mux. If pass 2 or the mux fails, it's left in `process_logs/` for inspection. Sources with no audio skip the mux step: pass 2 writes the final file directly.
 
 Output filename: `<base>_sl.mp4`
 
