@@ -71,7 +71,7 @@ sudo apt install -y python3-pip
 ## 5. Clone the repository
 
 ```bash
-git clone https://github.com/michaelangeletti/vdg.git
+git clone https://github.com/Stanford-Media-Preservation-Lab/vdg.git
 cd vdg
 ```
 

@@ -834,6 +834,18 @@ Check the process log for the specific frame numbers where the mismatch occurred
 
 Check the FFmpeg version first: `which ffmpeg && ffmpeg -version | head -1`. If it reports 8.x or 9.x, a `brew upgrade` or a third-party PPA has replaced the pinned build. Reinstall per [Supported FFmpeg versions](#supported-ffmpeg-versions). On macOS, check the startup dependency list: if `ffmpeg` isn't under `/opt/homebrew/opt/ffmpeg@7/bin`, vdg ran without its alias (e.g. `\vdg`), or the alias is missing its `PATH=` prefix. `which ffmpeg` in a plain terminal showing Homebrew's regular FFmpeg is expected.
 
+### `vdg --version` shows unrecognized flags, or no `--version` output at all
+
+This means `pipx` installed the wrong package. There's an unrelated package on PyPI also named `vdg` (a VCB-Studio anime-release tool, nothing to do with this lab), and a bare `pipx install vdg` — without the `git+https://...` URL — resolves against PyPI and silently installs that instead. This typically happens right after a `pipx uninstall vdg`, since pipx forgets the original git source at that point. Fix:
+
+```bash
+pipx uninstall vdg
+pipx install git+https://github.com/Stanford-Media-Preservation-Lab/vdg.git
+vdg --version
+```
+
+See [INSTALL_MACOS.md](INSTALL_MACOS.md#worker-bee-workstations-installupgrade-via-pipx) for the full pipx install/upgrade workflow for non-development workstations.
+
 ### "mediaconch not found in PATH — policy conformance checks will be skipped"
 
 MediaConch is optional; without it, `vdg` still runs framemd5/streamhash validation for `-v210`/`-ffv1` but skips the policy conformance step. See [INSTALL_MACOS.md](INSTALL_MACOS.md) or [INSTALL_UBUNTU.md](INSTALL_UBUNTU.md) for install instructions if you want policy checks enabled.

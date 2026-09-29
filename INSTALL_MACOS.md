@@ -103,9 +103,11 @@ brew install python@3.12
 ## 5. Clone the repository
 
 ```bash
-git clone https://github.com/michaelangeletti/vdg.git
+git clone https://github.com/Stanford-Media-Preservation-Lab/vdg.git
 cd vdg
 ```
+
+This is for the development machine (currently the laptop), where the repo is cloned locally and installed in editable mode. **Other lab workstations should use pipx instead — see [Worker-bee workstations: install/upgrade via pipx](#worker-bee-workstations-installupgrade-via-pipx) below — and can skip straight to that section.**
 
 ---
 
@@ -133,6 +135,52 @@ Add the above line to your `~/.zshrc` to make it permanent.
 vdg --help
 vdg --version
 ```
+
+`vdg --version` should print `Video Derivative Generator, vX.Y.Z, <Month Year>`. If it instead prints an argparse usage error mentioning flags you don't recognize (no `-ffv1`, no `-desktop-review`, no `--version` at all) — see the pipx section below; that's the sign of the PyPI name collision described there, not a broken vdg build.
+
+---
+
+## Worker-bee workstations: install/upgrade via pipx
+
+Development happens only on the lab's laptop (steps 1–7 above, with a local clone in editable mode). Every other lab workstation is a "worker bee" — it runs vdg via `pipx`, straight from the GitHub repo, with no local clone needed. Steps 1–4 above (FFmpeg, MediaInfo, Python) still apply; skip straight to this section instead of cloning the repo.
+
+### Install
+
+```bash
+pipx install git+https://github.com/Stanford-Media-Preservation-Lab/vdg.git
+```
+
+### Upgrade to the latest release
+
+```bash
+pipx upgrade vdg
+```
+
+Since the install has no pinned tag or branch, `pipx upgrade` re-fetches and picks up whatever is currently on `main` — this is how a worker-bee machine gets a new release without ever touching git directly.
+
+### ⚠️ Never run a bare `pipx install vdg` (no URL)
+
+**There is an unrelated package on PyPI also named `vdg`** (a VCB-Studio anime-release tool — nothing to do with this lab). `pipx install vdg` without the `git+https://...` URL resolves against PyPI by default and will silently install *that* package instead, with a completely different, unrecognizable set of command-line flags and no `--version` output in the expected format. This is exactly what happens after a `pipx uninstall vdg` — pipx forgets the original git source, so a plain re-`install` falls through to PyPI.
+
+**If this happens to you:**
+
+```bash
+pipx uninstall vdg
+pipx install git+https://github.com/Stanford-Media-Preservation-Lab/vdg.git
+vdg --version
+```
+
+**Rule of thumb:** `pipx upgrade vdg` is always safe (it reuses the already-recorded git source). `pipx install vdg` is only ever safe with the full `git+https://...` URL attached — never the bare package name.
+
+### Per-machine default paths
+
+Worker-bee installs don't have a local `cli.py` to hardcode default `--source-dir`/`--output-dir` paths into (that's the editable-install approach used on the dev laptop). Instead, set them in a `vdg` shell alias in `~/.zshrc`:
+
+```bash
+alias vdg='vdg --source-dir "/path/to/this/machine/source" --output-dir "/path/to/this/machine/output"'
+```
+
+Quote each path if it contains spaces (e.g. a RAID volume name like `RAID 1`) — an unquoted path with spaces breaks the alias in a way that isn't obvious from `--dry-run` output alone.
 
 ---
 
