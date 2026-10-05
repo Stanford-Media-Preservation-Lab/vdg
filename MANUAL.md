@@ -1,5 +1,5 @@
 # Video Derivative Generator (vdg)
-## User Manual — v1.7.0
+## User Manual — v1.7.1
 **Stanford Media Preservation Lab**
 *September 2026*
 
@@ -888,18 +888,18 @@ This means `pipx` installed the wrong package. There's an unrelated package on P
 
 ```bash
 pipx uninstall vdg
-pipx install git+https://github.com/Stanford-Media-Preservation-Lab/vdg.git@v1.7.0
+pipx install git+https://github.com/Stanford-Media-Preservation-Lab/vdg.git@v1.7.1
 vdg --version
 ```
 
-(Use whatever the current release tag actually is, not necessarily `v1.7.0`.) See [INSTALL_MACOS.md](INSTALL_MACOS.md#worker-bee-workstations-installupgrade-via-pipx) for the full pipx install/upgrade workflow for non-development workstations.
+(Use whatever the current release tag actually is, not necessarily `v1.7.1`.) See [INSTALL_MACOS.md](INSTALL_MACOS.md#worker-bee-workstations-installupgrade-via-pipx) for the full pipx install/upgrade workflow for non-development workstations.
 
 ### `pipx upgrade vdg` reports "vdg is unchanged" even though a new version was released
 
 Worker-bee installs are pinned to a release tag (`git+https://...@vX.Y.Z`), not to `main`. `pipx upgrade` only works for an unpinned git install; for a pinned one, pip treats the pinned ref as already satisfied and never checks for anything newer, so `pipx upgrade` reports no change even when a new tag exists. Upgrading a pinned install is always a forced reinstall naming the new tag explicitly:
 
 ```bash
-pipx install --force git+https://github.com/Stanford-Media-Preservation-Lab/vdg.git@v1.7.0
+pipx install --force git+https://github.com/Stanford-Media-Preservation-Lab/vdg.git@v1.7.1
 ```
 
 **Do not follow pipx's own suggested fallback command literally** (`pipx install --force vdg`) — with no git URL attached, `--force` will overwrite the working install with the unrelated PyPI package described above.
@@ -951,6 +951,9 @@ The script checks for a minimum of 10 GB free in the output directory before pro
 ---
 
 ## Version History
+
+### v1.7.1 — October 2026
+- **`--trim-in`/`--trim-out` full-decode validation timeout fixed:** the decode check reused the flat `VALIDATION_TIMEOUT` (300s/5min) sized for the much smaller/faster H.264 derivative check, which meant a trim of a full-length preservation master (the feature's actual use case — e.g. a 1-hour FFV1 capture) could fail validation with "Validation timeout" even though the trim itself was fine. The decode timeout now scales with the requested span (budgeted at 1/4 real time plus a flat buffer), never shrinking below the previous flat timeout for short trims.
 
 ### v1.7.0 — September 2026
 - **`--trim-in`/`--trim-out` added:** a standalone lossless stream-copy trim of a single over-run capture (e.g. trailing snow/black after a digitization session ran long), alongside thumbnails-only mode. See [Trimming an Over-Run Capture](#trimming-an-over-run-capture).

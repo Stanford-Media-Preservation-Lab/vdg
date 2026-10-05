@@ -149,20 +149,20 @@ Development happens only on the lab's laptop (steps 1–7 above, with a local cl
 ### Install (pin to the current release)
 
 ```bash
-pipx install git+https://github.com/Stanford-Media-Preservation-Lab/vdg.git@v1.7.0
+pipx install git+https://github.com/Stanford-Media-Preservation-Lab/vdg.git@v1.7.1
 ```
 
-Always include the `@vX.Y.Z` tag. Check the [repo's releases/tags](https://github.com/Stanford-Media-Preservation-Lab/vdg/tags) for the current version if you're not sure it's still `v1.7.0`.
+Always include the `@vX.Y.Z` tag. Check the [repo's releases/tags](https://github.com/Stanford-Media-Preservation-Lab/vdg/tags) for the current version if you're not sure it's still `v1.7.1`.
 
 ### Upgrade to a new release
 
 **`pipx upgrade vdg` will not work for a tag-pinned install** — pip treats a pinned git ref as already satisfied and pipx will report "vdg is unchanged" without checking anything, even when a newer tag exists. Every upgrade is a forced reinstall naming the new tag explicitly:
 
 ```bash
-pipx install --force git+https://github.com/Stanford-Media-Preservation-Lab/vdg.git@v1.7.0
+pipx install --force git+https://github.com/Stanford-Media-Preservation-Lab/vdg.git@v1.7.1
 ```
 
-Replace `v1.7.0` with whatever the new release tag actually is.
+Replace `v1.7.1` with whatever the new release tag actually is.
 
 ### ⚠️ Never install or upgrade by bare package name alone
 
@@ -172,7 +172,7 @@ Replace `v1.7.0` with whatever the new release tag actually is.
 
 ```bash
 pipx uninstall vdg
-pipx install git+https://github.com/Stanford-Media-Preservation-Lab/vdg.git@v1.7.0
+pipx install git+https://github.com/Stanford-Media-Preservation-Lab/vdg.git@v1.7.1
 vdg --version
 ```
 

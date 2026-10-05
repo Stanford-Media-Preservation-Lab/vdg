@@ -1032,3 +1032,50 @@ class TestValidateTrimOutput:
             ok, messages = validate_trim_output(Path("src.mkv"), Path("out.mkv"), 0.0, 10.0)
         assert ok is False
         assert any("Full decode validation FAILED" in m for m in messages)
+
+    def test_decode_timeout_scales_with_requested_duration(self):
+        """Regression test for a real production failure (video1, 2026-10):
+        a 1-hour FFV1 trim's full decode validation failed with 'Validation
+        timeout' because the decode subprocess used the flat
+        VALIDATION_TIMEOUT (300s / 5 min) — sized for the much smaller/faster
+        H.264 derivative check in validate_output(), not a full-length
+        lossless master. The decode timeout must scale with the requested
+        span instead of staying flat."""
+        streams_dicts = [{"codec_type": "video", "codec_name": "ffv1"}]
+        captured_kwargs = {}
+
+        def fake_run(cmd, **kwargs):
+            if 'ffprobe' in cmd[0]:
+                return self._streams_result(streams_dicts)
+            captured_kwargs.update(kwargs)
+            return MagicMock(returncode=0, stderr="")
+
+        with patch('vdg.cli.subprocess.run', side_effect=fake_run), \
+             patch('vdg.cli.get_video_info', return_value=types.SimpleNamespace(duration=3600.0)):
+            # 1-hour requested span, same as the real failure
+            validate_trim_output(Path("src.mkv"), Path("out.mkv"), 0.0, 3600.0)
+
+        # Flat VALIDATION_TIMEOUT (300s) would have been nowhere near enough
+        # for a 3600s request — the scaled timeout must exceed it by a lot.
+        from vdg.cli import VALIDATION_TIMEOUT
+        assert captured_kwargs['timeout'] > VALIDATION_TIMEOUT
+        assert captured_kwargs['timeout'] >= 3600 * 4  # at least the 1/4-real-time decode budget
+
+    def test_decode_timeout_floor_for_short_trims(self):
+        """A short requested span shouldn't shrink the decode timeout below
+        the caller's own default/explicit timeout."""
+        streams_dicts = [{"codec_type": "video", "codec_name": "ffv1"}]
+        captured_kwargs = {}
+
+        def fake_run(cmd, **kwargs):
+            if 'ffprobe' in cmd[0]:
+                return self._streams_result(streams_dicts)
+            captured_kwargs.update(kwargs)
+            return MagicMock(returncode=0, stderr="")
+
+        from vdg.cli import VALIDATION_TIMEOUT
+        with patch('vdg.cli.subprocess.run', side_effect=fake_run), \
+             patch('vdg.cli.get_video_info', return_value=types.SimpleNamespace(duration=10.0)):
+            validate_trim_output(Path("src.mkv"), Path("out.mkv"), 0.0, 10.0)
+
+        assert captured_kwargs['timeout'] >= VALIDATION_TIMEOUT

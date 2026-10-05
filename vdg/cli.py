@@ -31,7 +31,7 @@ from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 SCRIPT_TITLE = "Stanford Media Preservation Lab"
-SCRIPT_NAME = "Video Derivative Generator, v1.7.0, September 2026"
+SCRIPT_NAME = "Video Derivative Generator, v1.7.1, October 2026"
 SCRIPT_SEPARATOR = "----"
 
 # Highest FFmpeg major version vdg has been validated against (lossless
@@ -1067,6 +1067,7 @@ def validate_trim_output(source_path: Path, output_path: Path, requested_in: flo
     """
     messages: List[str] = []
     ok = True
+    requested_duration = requested_out - requested_in
 
     try:
         source_streams = probe_streams_summary(source_path)
@@ -1085,7 +1086,6 @@ def validate_trim_output(source_path: Path, output_path: Path, requested_in: flo
         ok = False
         messages.append(f"Duration check FAILED: could not read output duration: {e}")
     else:
-        requested_duration = requested_out - requested_in
         drift = output_duration - requested_duration
         tolerance = 15.0  # seconds — generous, to allow for a keyframe-boundary snap
         if abs(drift) > tolerance:
@@ -1097,16 +1097,28 @@ def validate_trim_output(source_path: Path, output_path: Path, requested_in: flo
                             f"was {format_duration(requested_duration)} (drift {drift:+.1f}s — expected if a trim "
                             f"point fell mid-GOP and ffmpeg snapped to the nearest keyframe)")
 
+    # Decoding a full-length lossless master (the normal case for a trim — this
+    # is specifically for recovering preservation masters, not short clips) can
+    # take far longer than VALIDATION_TIMEOUT's default 5 minutes, which was
+    # sized for the much smaller/faster-to-decode H.264 derivative check in
+    # validate_output(). The codebase's existing full-file lossless validation
+    # (run_validation_command_with_spinner's framemd5 hashing) deliberately
+    # uses no timeout at all for the same reason. Here we scale generously with
+    # the requested span instead of going unbounded, so a genuinely hung/broken
+    # decode still doesn't block forever: budget for decode at just 1/4 real
+    # time, plus a flat buffer for startup/probing overhead, with the caller's
+    # timeout as a floor (keeps short-clip callers, e.g. tests, unaffected).
+    decode_timeout = max(timeout, int(requested_duration * 4) + 60)
     cmd = ['ffmpeg', '-v', 'error', '-i', str(output_path), '-map', '0', '-f', 'null', '-']
     result = None
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=decode_timeout)
         decode_ok = result.returncode == 0 and len(result.stderr) == 0
     except subprocess.TimeoutExpired:
         decode_ok = False
     if not decode_ok:
         ok = False
-        err = result.stderr.strip()[:500] if result is not None else "Validation timeout"
+        err = result.stderr.strip()[:500] if result is not None else f"Validation timeout after {decode_timeout}s"
         messages.append(f"Full decode validation FAILED (-map 0, every stream): {err}")
     else:
         messages.append("Full decode validation passed: all streams (-map 0) decoded cleanly start to finish")
