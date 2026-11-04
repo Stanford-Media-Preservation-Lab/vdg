@@ -178,6 +178,62 @@ vdg --version
 
 **Rule of thumb:** every `pipx install`/`pipx install --force` for vdg must include the full `git+https://github.com/Stanford-Media-Preservation-Lab/vdg.git@vX.Y.Z` spec, tag included — there is no safe bare-name form of this command, for either a fresh install or an upgrade.
 
+### `zsh: bad interpreter` — but then it runs anyway, reporting an ancient version
+
+This is the most dangerous failure mode of the bunch, because it doesn't look like a failure. You'll see something like:
+
+```
+video2:~ % vdg -v210
+zsh: /Users/smpl/.local/bin/vdg: bad interpreter: /Users/smpl/.local/pipx/venvs/vdg/bin/python: no such file or directory
+
+Stanford Media Preservation Lab
+Video Derivative Generator, v1.1, May 2026
+----
+```
+
+The first line is real: pipx's own venv for `vdg` hard-codes the exact Python binary path it was built against (e.g. `/opt/homebrew/opt/python@3.14/bin/python3.14`). A Python/Homebrew update that removes or replaces that exact minor version breaks the shim, even though the venv folder itself may still be sitting there.
+
+**What's alarming is that the command didn't just fail and stop.** When a shell's `execve()` fails because a script's *interpreter* is missing (not the script itself), zsh/bash don't always stop the `$PATH` search the way they would for an ordinary "command not found" — they print the diagnostic and keep searching the rest of `$PATH` for another file also named `vdg`. If an old, unrelated `vdg` happens to exist further down `$PATH` — e.g. a leftover direct `pip install vdg` from before this lab standardized on the pipx pinned-tag workflow — that stale copy runs *instead*, silently, with no further error. The version banner is the only tell.
+
+This actually happened on `video2` (2026-11-04): the pipx shim was broken post-update, and `which -a vdg` turned up two forgotten direct-`pip`-installed copies from the original 2026-05-05 rollout:
+
+```bash
+$ which -a vdg
+vdg: aliased to PATH="..." command vdg --source-dir ... --output-dir ...
+/Users/smpl/.local/bin/vdg                                            # broken pipx shim
+/opt/homebrew/bin/vdg                                                 # stale: pip install against Homebrew python@3.14
+/Library/Frameworks/Python.framework/Versions/3.10/bin/vdg            # stale: pip install against python.org 3.10
+```
+
+One of these ran a real, several-versions-old `vdg` (`v1.1`) against a live preservation master until it was caught mid-transcode and killed — missing every correctness fix made since (the `setdar` PAR bug, the #10 audio-dropout fix, DV field-order handling, MediaConch policy changes, all of it).
+
+**Diagnose:**
+
+```bash
+which -a vdg          # lists every vdg found in $PATH, in search order, plus the alias
+```
+
+Anything beyond the alias line and exactly one pipx shim is a problem. Check each extra entry's shebang (`head -5 <path>`) to confirm it's a stale direct install, not something load-bearing.
+
+**Fix:**
+
+```bash
+# Remove every stray direct-install shim (NOT the pipx one — leave /Users/smpl/.local/bin/vdg)
+rm /opt/homebrew/bin/vdg
+rm "/Library/Frameworks/Python.framework/Versions/3.10/bin/vdg"
+# (repeat for any other stray entry which -a vdg turns up)
+
+# Then repair the actual pipx install — this rebuilds the venv against whatever
+# Python is live now, fixing the broken interpreter reference
+pipx uninstall vdg
+pipx install git+https://github.com/Stanford-Media-Preservation-Lab/vdg.git@v1.7.1
+
+which -a vdg          # should now show only the alias + one healthy pipx shim
+vdg --version
+```
+
+**If `vdg` ever reports a version you don't recognize, or lower than the current pinned tag, treat it as a sign of exactly this — run `which -a vdg` before trusting any output from that run.** Since this failure mode can lie dormant on any machine that had vdg installed before the pipx-pinned-tag convention was adopted (any lab Mac set up before mid-2026), it's worth running `which -a vdg` as a one-time proactive check across the fleet rather than waiting for the next workstation update to trip over it — it should show nothing but the alias line and a single pipx shim on every machine.
+
 ### Per-machine default paths
 
 Worker-bee installs don't have a local `cli.py` to hardcode default `--source-dir`/`--output-dir` paths into (that's the editable-install approach used on the dev laptop). Instead, set them in a `vdg` shell alias in `~/.zshrc`:

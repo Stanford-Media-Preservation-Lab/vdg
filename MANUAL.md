@@ -904,6 +904,10 @@ pipx install --force git+https://github.com/Stanford-Media-Preservation-Lab/vdg.
 
 **Do not follow pipx's own suggested fallback command literally** (`pipx install --force vdg`) — with no git URL attached, `--force` will overwrite the working install with the unrelated PyPI package described above.
 
+### `vdg` runs but reports an old/unfamiliar version, or you see "bad interpreter" followed by output anyway
+
+The most dangerous pipx failure: a Python/Homebrew update broke the pipx shim's hard-coded interpreter path, but instead of just failing, the shell fell through to a different, stale `vdg` elsewhere in `$PATH` (typically a direct `pip install vdg` left over from before this lab adopted the pipx pinned-tag workflow) and ran *that* silently — no error beyond the version banner looking wrong. Run `which -a vdg` to see every `vdg` found in `$PATH`; there should be nothing but the alias line and exactly one pipx shim. See [INSTALL_MACOS.md](INSTALL_MACOS.md#worker-bee-workstations-installupgrade-via-pipx) for the full diagnosis and cleanup (confirmed on `video2`, 2026-11-04).
+
 ### "mediaconch not found in PATH — policy conformance checks will be skipped"
 
 MediaConch is optional; without it, `vdg` still runs framemd5/streamhash validation for `-v210`/`-ffv1` but skips the policy conformance step. See [INSTALL_MACOS.md](INSTALL_MACOS.md) or [INSTALL_UBUNTU.md](INSTALL_UBUNTU.md) for install instructions if you want policy checks enabled.
