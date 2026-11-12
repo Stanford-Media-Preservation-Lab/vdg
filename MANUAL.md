@@ -882,6 +882,34 @@ Check the process log for the specific frame numbers where the mismatch occurred
 
 Check the FFmpeg version first: `which ffmpeg && ffmpeg -version | head -1`. If it reports 8.x or 9.x, a `brew upgrade` or a third-party PPA has replaced the pinned build. Reinstall per [Supported FFmpeg versions](#supported-ffmpeg-versions). On macOS, check the startup dependency list: if `ffmpeg` isn't under `/opt/homebrew/opt/ffmpeg@7/bin`, vdg ran without its alias (e.g. `\vdg`), or the alias is missing its `PATH=` prefix. `which ffmpeg` in a plain terminal showing Homebrew's regular FFmpeg is expected.
 
+### `dyld: Library not loaded: .../libXXX.N.M.dylib` — ffmpeg/ffprobe aborts before it starts (macOS)
+
+After a `brew update`/`brew upgrade` (often alongside a macOS update), `ffmpeg` or `ffprobe` aborts immediately with something like:
+
+```
+dyld[NNNN]: Library not loaded: /opt/homebrew/opt/jpeg-xl/lib/libjxl.0.12.dylib
+  Referenced from: /opt/homebrew/Cellar/ffmpeg@7/7.1.5_3/bin/ffprobe
+  Reason: tried: '.../libjxl.0.12.dylib' (no such file), ...
+zsh: abort      ffprobe ...
+```
+
+This is **not** the case above (ffmpeg wasn't replaced — `ffmpeg@7` is still pinned and in place). Instead, `brew upgrade` bumped one of ffmpeg's *dependency* libraries to a new version with a different soname (here `jpeg-xl` 0.12 → 0.13, so `libjxl.0.12.dylib` → `libjxl.0.13.dylib`), and the old versioned dylib the pinned `ffmpeg@7` binary was linked against no longer exists on disk. `dyld` can't resolve the reference, so the binary aborts before doing anything. The library named in the error can be any ffmpeg dependency, not just jpeg-xl.
+
+**Fix — reinstall the dependent so it relinks against the current dependency:**
+
+```bash
+brew reinstall ffmpeg@7
+```
+
+This relinks `ffmpeg@7` against the now-current library versions, keeping it on major version 7 (the pinned version — `ffmpeg@7` is the versioned formula, so a reinstall never jumps it to 8.x/9.x). Then confirm:
+
+```bash
+ffmpeg -version | head -1       # single dash; should report 7.1.x, no dyld abort
+ffprobe -version | head -1
+```
+
+If the plain reinstall errors or grabs an unexpected build, fall back to `brew reinstall --build-from-source ffmpeg@7` (slower). Do **not** reinstall the dependency (`jpeg-xl`) to fix this — it's already at the new version; the broken reference is in the ffmpeg binary, which is what needs relinking. Confirmed on the video laptop (2026-11-12, after macOS 27.2.1 + `brew update`).
+
 ### `vdg --version` shows unrecognized flags, or no `--version` output at all
 
 This means `pipx` installed the wrong package. There's an unrelated package on PyPI also named `vdg` (a VCB-Studio anime-release tool, nothing to do with this lab), and any pipx command that drops the full `git+https://...@vX.Y.Z` spec — a bare `pipx install vdg`, or the bare `pipx install --force vdg` that `pipx upgrade` itself suggests when it can't upgrade a tag-pinned install — resolves against PyPI instead and silently installs that wrong package. This is especially easy to hit right after a `pipx uninstall vdg`, since pipx forgets the original git source at that point. Fix:
